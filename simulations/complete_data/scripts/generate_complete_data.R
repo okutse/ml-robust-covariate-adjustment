@@ -1,112 +1,152 @@
-## install all required packages
-ipak <- function(pkg){
+ipak <- function(pkg) {
   new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
-  if (length(new.pkg))
-    install.packages(new.pkg, dependencies = TRUE, repos='http://cran.rstudio.com/')
+  if (length(new.pkg)) {
+    install.packages(new.pkg, dependencies = TRUE, repos = "http://cran.rstudio.com/")
+  }
   sapply(pkg, require, character.only = TRUE)
 }
-packages =c( "tidyverse","knitr", "kableExtra","skimr", "MatchIt", "RItools","optmatch", "ggplot2", "tufte", "tufterhandout", "plotly", "snowfall", "rstan", "gridExtra", "knitr", "gtsummary", "data.table", "GGally", "MASS", "broom", "boot", "foreach", "doParallel", "glmnet", "tidymodels" , "usemodels", "magrittr")
+
+packages <- c("MASS", "foreach", "doParallel", "doRNG")
 ipak(packages)
 
-## set the working directory
-##setwd("C:\\Users\\aokutse\\OneDrive - Brown University\\ThesisResults\\data")
+output_dir <- file.path("simulations", "complete_data", "datasets")
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
 
-## data generating function
-set.seed(123)
-rm(list = ls())
+expit <- function(x) {
+  1 / (1 + exp(-x))
+}
 
-dgp <- function(n = NULL, ss = NULL)
-{
-  # treatment variable
-  A <- c()
-  for (i in 1:n){if (i <= n/2){ A[i] = 1} else {if (i > n/2){A[i] = 0}}}
-  # create the variance-covariance matrix
-  sigma <- matrix(0, nrow = 4, ncol = 4)
-  diag(sigma) <- 1
-  # create the vector of Zi's which generate the outcome yi
-  mat <- MASS::mvrnorm(n = n, mu = c(0, 0, 0, 0), Sigma = sigma)
-  colnames(mat) <- c("z1", "z2", "z3", "z4")
-  # generate the error term
-  e <- rnorm(n = n, mean = 0, sd = ss)
-  # generate the outcome variable based on the specified model
-  y <- 210 + 50*A + 27.4*mat[ ,1] + 13.7*mat[, 2] + 13.7*mat[, 3] + 13.7*mat[, 4] + e
-  # generate the xi's actually observed by analyst
-  x1 <- exp(mat[, 1]/2); x2 <- (mat[, 2]/ (1 + exp(mat[, 1]))) + 10; x3 <- (((mat[, 1]*mat[, 3])/25) + 0.6)^3; x4 <- (mat[,2] + mat[,4] + 20)^2
-  # create the missing data variable based on the treatment
-  pi <- locfit::expit(-mat[, 1]+0.5*mat[, 2]-0.25*mat[, 3]-0.1*mat[, 4])
-  R = rbinom(n = n, size = 1, prob = pi)
-  # save variables as a data frame
-  df <-data.frame(y, A, x1, x2, x3, x4, R)
+generate_complete_data <- function(n, target_r2, max_attempts = 50) {
+  A <- c(rep(1, floor(n / 2)), rep(0, n - floor(n / 2)))
+  sigma <- diag(4)
+
+  attempt <- 1
+  repeat {
+    mat <- MASS::mvrnorm(n = n, mu = c(0, 0, 0, 0), Sigma = sigma)
+    colnames(mat) <- c("z1", "z2", "z3", "z4")
+
+    y_signal <- 210 + 50 * A + 27.4 * mat[, 1] + 13.7 * mat[, 2] + 13.7 * mat[, 3] + 13.7 * mat[, 4]
+    x1 <- exp(mat[, 1] / 2)
+    x2 <- (mat[, 2] / (1 + exp(mat[, 1]))) + 10
+    x3 <- (((mat[, 1] * mat[, 3]) / 25) + 0.6) ^ 3
+    x4 <- (mat[, 2] + mat[, 4] + 20) ^ 2
+    pi <- expit(-mat[, 1] + 0.5 * mat[, 2] - 0.25 * mat[, 3] - 0.1 * mat[, 4])
+    R <- rbinom(n = n, size = 1, prob = pi)
+
+    e0 <- rnorm(n = n, mean = 0, sd = 1)
+    r2_for_sd <- function(sd) {
+      y <- y_signal + sd * e0
+      fit <- lm(y ~ A + x1 + x2 + x3 + x4)
+      summary(fit)$r.squared
+    }
+
+    ## retry the draw if the target R2 is unattainable even at ss = 0
+    r2_at0 <- r2_for_sd(0)
+    if (target_r2 <= r2_at0) {
+      break
+    }
+    attempt <- attempt + 1
+    if (attempt > max_attempts) {
+      stop("Target R2 exceeds the maximum achievable after max_attempts draws.")
+    }
+  }
+
+  sd_hi <- 1
+  r2_hi <- r2_for_sd(sd_hi)
+  while (r2_hi > target_r2) {
+    sd_hi <- sd_hi * 2
+    r2_hi <- r2_for_sd(sd_hi)
+    if (sd_hi > 1e6) {
+      stop("Failed to bracket target R2.")
+    }
+  }
+
+  sd <- uniroot(
+    function(sd) r2_for_sd(sd) - target_r2,
+    lower = 0,
+    upper = sd_hi,
+    tol = 1e-10
+  )$root
+
+  achieved_r2 <- r2_for_sd(sd)
+  y <- y_signal + sd * e0
+
+  df <- data.frame(y, A, x1, x2, x3, x4, R, mat)
+  meta <- data.frame(
+    n = n,
+    target_r2 = target_r2,
+    achieved_r2 = round(achieved_r2, 2),
+    achieved_r2_raw = achieved_r2,
+    ss = sd,
+    stringsAsFactors = FALSE
+  )
+
+  list(data = df, meta = meta)
+}
+
+format_r2 <- function(r2) {
+  gsub("\\.", "p", sprintf("%.2f", r2))
+}
+
+# 1. Generate complete datasets across n and R^2 values for downstream analysis
+reps <- 1000
+sample_sizes <- c(200, 500, 1000, 2000, 10000)
+target_r2s <- c(0.20, 0.40, 0.60, 0.80) # these are achieved by varying the noise level (\sigma_Z) in the data generating process
+base_seed <- 12345
+
+cores <- parallel::detectCores(logical = TRUE)
+registerDoParallel(max(1, cores - 1))
+
+for (n in sample_sizes) {
+  for (target_r2 in target_r2s) {
+    scenario_seed <- base_seed + n + as.integer(round(target_r2 * 100))
+    doRNG::registerDoRNG(scenario_seed)
+
+    results <- foreach(i = seq_len(reps)) %dopar% {
+      res <- generate_complete_data(n, target_r2)
+      res$meta$replicate <- i
+      res
+    }
+
+    datasets <- lapply(results, function(x) x$data)
+    metadata <- do.call(rbind, lapply(results, function(x) x$meta))
+
+    r2_label <- format_r2(target_r2)
+    file_base <- sprintf("complete_n%d_r2_%s", n, r2_label)
+    save(
+      datasets,
+      metadata,
+      file = file.path(output_dir, paste0(file_base, ".RData"))
+    )
+  }
 }
 
 
-## generate and save the individual data frames under different scenarios
-df_one <- dgp(n = 500, ss = 1)    ## n = 500, sd = 1
-df_oneb <- dgp(n = 500, ss = 23)  ## n = 500, sd = 23
-df_two <- dgp(n = 500, ss = 45)   ## n = 500, sd = 45
-df_twob <- dgp(n = 500, ss = 68)  ## n = 500, sd = 67
-df_three <- dgp(n = 2000, ss = 1) ## n = 2000, sd = 1
-df_threeb <- dgp(n = 2000, ss = 23) ## n = 2000, sd = 23
-df_four <- dgp(n = 2000, ss = 45) ## n = 2000, sd = 45
-df_fourb <- dgp(n = 2000, ss = 68) ## n = 2000, sd = 68
+# 2. Generate a large dataset for estimating model parameters with high precision: asymptotic performance check
+large_n <- 5 * 10^7
+large_seed_base <- 54321
+run_large_data <- tolower(Sys.getenv("RUN_LARGE_DATA", "false")) == "true"
 
-## these data refer to case when n = 10000 and sd = 1 and 45 respectively (added to see pattern in efficiency for complete data)
-df_five <- dgp(n = 10000, ss = 1) ## n = 1000, sd = 1
-df_fiveb <- dgp(n = 10000, ss = 45) ## n = 10000, sd = 45
+# Note: This may take a long time to run and produce a very large file, so it's gated behind an environment variable
+run_large_data <- FALSE 
+if (run_large_data) {
+  for (target_r2 in target_r2s) {
+    large_seed <- large_seed_base + as.integer(round(target_r2 * 100))
+    set.seed(large_seed)
 
-## save the individual data sets
-save(df_one, file = "df_one.RData")
-save(df_two, file = "df_two.RData")
-save(df_three, file = "df_three.RData")
-save(df_four, file = "df_four.RData")
+    res <- generate_complete_data(large_n, target_r2)
+    res$meta$replicate <- 1
+    res$meta$n <- large_n
 
-## save the new batch of data sets
-save(df_oneb, file = "df_oneb.RData")
-save(df_twob, file = "df_twob.RData")
-save(df_threeb, file = "df_threeb.RData")
-save(df_fourb, file = "df_fourb.RData")
-
-## save the additional data for efficiency computation at n = 10000
-save(df_five, file = "df_five.RData")
-save(df_fiveb, file = "df_six.RData")
-
-
-
-## create the 1000 replications of each data set and save them
-cores <- detectCores()
-registerDoParallel(cores-1)
-dsets1 = foreach(1:1000) %dopar% dgp(n = 500, ss = 1)
-dsets2 = foreach(1:1000) %dopar% dgp(n = 500, ss = 45)
-dsets3 = foreach(1:1000) %dopar% dgp(n = 2000, ss = 1)
-dsets4 = foreach(1:1000) %dopar% dgp(n = 2000, ss = 45)
-dsets5 = foreach(1:1000) %dopar% dgp(n = 10000, ss = 1)
-dsets6 = foreach(1:1000) %dopar% dgp(n = 10000, ss = 45)
-
-## save the list of 1000 data frames under different scenarios
-save(dsets1, file = "dsets1.RData") ## n = 500, sd = 1
-save(dsets2, file = "dsets2.RData") ## n = 500, sd = 45
-save(dsets3, file = "dsets3.RData") ## n = 2000, sd = 1
-save(dsets4, file = "dsets4.RData") ## n = 2000, sd = 45
-save(dsets5, file = "dsets5.RData") ## n = 10000, sd = 1
-save(dsets6, file = "dsets6.RData") ## n = 10000, sd = 45
-
-#########################################
-## create the new batch of data files for the case when sd = 23 and sd = 68, respectively.
-dsets11 = foreach(1:1000) %dopar% dgp(n = 500, ss = 23)
-dsets22 = foreach(1:1000) %dopar% dgp(n = 500, ss = 68)
-dsets33 = foreach(1:1000) %dopar% dgp(n = 2000, ss = 23)
-dsets44 = foreach(1:1000) %dopar% dgp(n = 2000, ss = 68)
-## save the 1000 simulated data sets for each additional scenario
-save(dsets11, file = "dsets11.RData") ## n = 500, sd = 23
-save(dsets22, file = "dsets22.RData") ## n = 500, sd = 68
-save(dsets33, file = "dsets33.RData") ## n = 2000, sd = 23
-save(dsets44, file = "dsets44.RData") ## n = 2000, sd = 68
-
-
-########################################
-## create additional data files for additional simulations under full data analysis with n = 10, 000
-## for each case under complete data, add a single case with n = 10, 000. dsets 5.
-
-
-
-## end of data file
+    r2_label <- format_r2(target_r2)
+    ss_label <- format_r2(res$meta$ss)
+    file_base <- sprintf("complete_n%d_r2_%s_ss_%s", large_n, r2_label, ss_label)
+    save(
+      res$data,
+      res$meta,
+      file = file.path(output_dir, paste0(file_base, ".RData"))
+    )
+  }
+}
