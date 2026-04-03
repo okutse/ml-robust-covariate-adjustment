@@ -56,3 +56,9 @@ simulations/complete_data/scripts/*.bash
 
 # ignore the manifest file from repository
 simulations/complete_data/complete_data_results/single_stage_input_manifest.csv
+
+# renv artifacts
+renv/library/
+renv/staging/
+renv/python/
+renv/.cache/

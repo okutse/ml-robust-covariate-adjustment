@@ -1,6 +1,6 @@
 packages <- c(
   "foreach", "doParallel", "parsnip", "ranger",
-  "dbarts", "SuperLearner", "xgboost"
+  "dbarts", "SuperLearner", "xgboost", "bartMachine"
 )
 
 ipak <- function(pkg) {
@@ -10,7 +10,6 @@ ipak <- function(pkg) {
   }
   sapply(pkg, require, character.only = TRUE)
 }
-
 ipak(packages)
 
 source(file.path("simulations", "complete_data", "scripts", "single_stage_model_helpers.R"))
