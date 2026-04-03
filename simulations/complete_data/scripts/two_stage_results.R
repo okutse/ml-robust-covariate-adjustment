@@ -84,6 +84,10 @@ if (data_source == "regenerate") {
   }
   source(file.path("simulations", "complete_data", "scripts", "generate_complete_data.R"))
 } else if (data_source == "archive") {
+  # allow ARCHIVE_DATASETS_DIR=local to use the repo datasets folder directly
+  if (archive_dir %in% c("local", "local_datasets")) {
+    archive_dir <- local_datasets_dir
+  }
   if (archive_dir == "") {
     zenodo_cache <- file.path("simulations", "complete_data", "archives", "zenodo")
     archive_url <- resolve_zenodo_url(zenodo_doi, zenodo_url)

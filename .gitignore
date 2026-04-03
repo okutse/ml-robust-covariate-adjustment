@@ -51,3 +51,6 @@ rsconnect/
 # ignore the datasets from uploading to GitHub. Archived in Zenodo and available on request.
 simulations/complete_data/datasets/*.RData
 
+# ignore all .bash files from repository
+simulations/complete_data/scripts/*.bash
+
