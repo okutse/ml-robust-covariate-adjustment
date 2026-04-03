@@ -14,8 +14,6 @@ unadj <- function(df = NULL){
 }
 
 
-
-
 # 2. Main effects Linear Regression (MLR)
 lm_one <- function(df = NULL){
   # fit random forest model for all individuals

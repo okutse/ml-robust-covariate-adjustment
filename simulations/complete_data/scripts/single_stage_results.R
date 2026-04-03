@@ -1,6 +1,6 @@
 packages <- c(
   "foreach", "doParallel", "parsnip", "ranger",
-  "dbarts", "SuperLearner", "xgboost", "bartMachine"
+  "dbarts", "SuperLearner", "xgboost"
 )
 
 ipak <- function(pkg) {

@@ -21,7 +21,6 @@ unadj <- function(df = NULL){
 
 
 
-
 # 2. Main effects Linear Regression (MLR)
 lm_one_cv <- function(df) {
   # Define cross-validation folds
@@ -62,7 +61,6 @@ lm_one_cv <- function(df) {
   # Return result
   return(data.frame(ATE_adjusted = ATE_adjusted, bias_adjusted = bias_adjusted))
 }
-
 
 
 
