@@ -1,6 +1,10 @@
+# This script runs the single-stage models on the complete data scenarios and saves the results.
+# Author: A. Okutse
+# Date Modified: 2026
+
 packages <- c(
   "foreach", "doParallel", "parsnip", "ranger",
-  "dbarts", "SuperLearner", "xgboost", "bartMachine"
+  "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr"
 )
 
 ipak <- function(pkg) {
@@ -12,7 +16,7 @@ ipak <- function(pkg) {
 }
 ipak(packages)
 
-source(file.path("simulations", "complete_data", "scripts", "single_stage_model_helpers.R"))
+source(file.path("simulations", "complete_data", "scripts", "non_cf", "single_stage_model_helpers.R"))
 
 
 # set environment variables to control data source and syncing behavior
@@ -29,6 +33,22 @@ output_dir <- file.path("simulations", "complete_data", "complete_data_results")
 if (!dir.exists(output_dir)) {
   dir.create(output_dir, recursive = TRUE)
 }
+procedure_name <- "single_stage"
+scenario_output_dir <- file.path(output_dir, procedure_name)
+if (!dir.exists(scenario_output_dir)) {
+  dir.create(scenario_output_dir, recursive = TRUE)
+}
+
+# create a log directory and file for capturing console output
+log_dir <- file.path("logs", "complete_data", procedure_name)
+if (!dir.exists(log_dir)) {
+  dir.create(log_dir, recursive = TRUE)
+}
+log_path <- file.path(log_dir, paste0(procedure_name, "_logs.txt"))
+
+## capture console output in a log file while keeping it in the console
+sink(log_path, append = TRUE, split = TRUE)
+on.exit(sink(), add = TRUE)
 
 # function to resolve the Zenodo URL from either a direct URL or a DOI
 resolve_zenodo_url <- function(doi, url) {
@@ -138,7 +158,28 @@ if (length(input_files) == 0) {
 
 cat("Using datasets from:", input_dir, "\n")
 
-cat("Running single-stage models on", length(input_files), "scenario files.\n")
+# checkpoint to resume processing after interruption
+checkpoint_path <- file.path(scenario_output_dir, paste0(procedure_name, "_checkpoint.csv"))
+reset_checkpoint <- tolower(Sys.getenv("RESET_CHECKPOINT", "false")) %in% c("true", "t", "1")
+if (reset_checkpoint && file.exists(checkpoint_path)) {
+  file.remove(checkpoint_path)
+  cat("RESET_CHECKPOINT enabled: cleared", checkpoint_path, "\n")
+}
+if (reset_checkpoint && dir.exists(scenario_output_dir)) {
+  scenario_csvs <- list.files(scenario_output_dir, pattern = "\\.csv$", full.names = TRUE)
+  if (length(scenario_csvs) > 0) {
+    file.remove(scenario_csvs)
+  }
+  cat("RESET_CHECKPOINT enabled: cleared per-scenario outputs in", scenario_output_dir, "\n")
+}
+processed_files <- character(0)
+if (file.exists(checkpoint_path)) {
+  processed <- read.csv(checkpoint_path, stringsAsFactors = FALSE)
+  processed_files <- processed$file
+}
+pending_files <- input_files[!basename(input_files) %in% processed_files]
+
+cat("Running single-stage models on", length(pending_files), "scenario files.\n")
 
 input_manifest <- data.frame(
   data_source = data_source,
@@ -149,32 +190,56 @@ input_manifest <- data.frame(
 )
 write.csv(
   input_manifest,
-  file = file.path(output_dir, "single_stage_input_manifest.csv"),
+  file = file.path(scenario_output_dir, paste0(procedure_name, "_input_manifest.csv")),
   row.names = FALSE
 )
 
-results <- do.call(rbind, lapply(input_files, function(file_path) {
+results <- do.call(rbind, lapply(pending_files, function(file_path) {
   cat("Processing scenario:", basename(file_path), "\n")
   scenario <- load_scenario(file_path)
-  results <- run_single_stage(
-    datasets = scenario$datasets,
-    metadata = scenario$metadata,
-    methods = get_single_stage_registry(),
-    use_parallel = TRUE,
-    cores = parallel::detectCores(logical = TRUE),
-    cl = NULL
+  timing <- system.time({
+    results <- run_single_stage(
+      datasets = scenario$datasets,
+      metadata = scenario$metadata,
+      methods = get_single_stage_registry(),
+      use_parallel = TRUE,
+      cores = parallel::detectCores(logical = TRUE),
+      cl = NULL
+    )
+  })
+  cat("Completed scenario:", basename(file_path), "in", round(timing[["elapsed"]], 2), "seconds.\n")
+  # write per-scenario results before checkpointing
+  scenario_name <- tools::file_path_sans_ext(basename(file_path))
+  scenario_csv <- file.path(scenario_output_dir, paste0(scenario_name, ".csv"))
+  write.csv(results, file = scenario_csv, row.names = FALSE)
+  write.table(
+    data.frame(file = basename(file_path), stringsAsFactors = FALSE),
+    file = checkpoint_path,
+    append = TRUE,
+    sep = ",",
+    col.names = !file.exists(checkpoint_path),
+    row.names = FALSE
   )
-  cat("Completed scenario:", basename(file_path), "\n")
+  cat("Checkpointed scenario:", basename(file_path), "\n")
   results
 }))
 
-write.csv(
-  results,
-  file = file.path(output_dir, "single_stage_results.csv"),
-  row.names = FALSE
+# aggregate all per-scenario results into a single output
+scenario_files <- list.files(
+  scenario_output_dir,
+  pattern = "^complete_n\\d+_r2_\\d+p\\d+\\.csv$",
+  full.names = TRUE
 )
+if (length(scenario_files) > 0) {
+  aggregated <- do.call(rbind, lapply(scenario_files, read.csv, stringsAsFactors = FALSE))
+  write.csv(
+    aggregated,
+    file = file.path(scenario_output_dir, paste0(procedure_name, "_results.csv")),
+    row.names = FALSE
+  )
+}
 
 # Example run (R terminal):
 # DATA_SOURCE=archive ARCHIVE_DATASETS_DIR=/path/to/zenodo/datasets \
 # SYNC_ARCHIVE_TO_LOCAL=true
-# Rscript simulations/complete_data/scripts/single_stage_results.R
+# Rscript simulations/complete_data/scripts/non_cf/single_stage_results.R

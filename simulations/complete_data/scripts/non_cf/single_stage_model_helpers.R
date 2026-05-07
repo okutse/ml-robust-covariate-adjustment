@@ -4,7 +4,6 @@
 # Date Modified: 2026
 
 
-
 # 1. Unadjusted
 unadj <- function(df = NULL){
   ## since this is based on the full data set, then use the full data set
@@ -93,7 +92,6 @@ rf_one <- function(df = NULL){
 
 
 
-
 # 5. Bayesian Additive Regression Trees (BART)
 bart_one <- function(df = NULL){
   # fit random forest model for all individuals
@@ -119,51 +117,231 @@ bart_one <- function(df = NULL){
 }
 
 
+## ------------------------------------------------------------------
+## Helpers for the custom dbarts learner
+## ------------------------------------------------------------------
 
-
-# 6. Super Learner (SL)
-super_one <- function(df = NULL, cl = NULL){
-  ## allow serial runs when no cluster is provided
-  if (is.null(cl)) {
-    all <- SuperLearner::SuperLearner(
-      Y = as.numeric(df[, 1]),
-      X = data.frame(df[, c(2, 3, 4, 5, 6)]),
-      cvControl = list(V = 10), # number of folds for CV.SuperLearner
-      family = gaussian(),
-      SL.library = c("SL.ranger", "SL.lm", "SL.bartMachine", "SL.xgboost"),
-      method = "method.NNLS")
-  } else {
-    all <- SuperLearner::snowSuperLearner(
-      Y = as.numeric(df[, 1]),
-      X = data.frame(df[, c(2, 3, 4, 5, 6)]),
-      cvControl = list(V = 10), # number of folds for CV.SuperLearner
-      family = gaussian(),
-      SL.library = c("SL.ranger", "SL.lm", "SL.bartMachine", "SL.xgboost"),
-      method = "method.NNLS",
-      cluster = cl)
+## Collapse posterior draws to one prediction per row of newdata.
+## dbarts can return either:
+##   - a vector
+##   - a matrix with rows = observations
+##   - a matrix with cols = observations
+## so we handle all three cases deterministically.
+.reduce_dbarts_pred <- function(pred_raw, n_obs) {
+  if (is.null(dim(pred_raw))) {
+    return(as.numeric(pred_raw))
   }
   
-  ## set A = 0 and generate predictions for everyone
-  df_A0 <- data.frame(df[, c(2, 3, 4, 5, 6)])
-  df_A0$A <- 0
-  pred_A0 <- predict.SuperLearner(object = all, newdata = df_A0, onlySL = TRUE)
+  if (nrow(pred_raw) == n_obs) {
+    return(rowMeans(pred_raw))
+  }
   
-## set A = 1 and generate predictions for everyone
-  df_A1 <- data.frame(df[, c(2, 3, 4, 5, 6)])
-  df_A1$A <- 1
-  pred_A1 <- predict.SuperLearner(object = all, newdata = df_A1, onlySL = TRUE)
-## compute the ATE
-  ATE_adjusted = mean(pred_A1$pred - pred_A0$pred)
-## compute the bias
-  bias_adjusted = ATE_adjusted - 50
-## return the results as a data frame
-  rslt = data.frame("ATE_adjusted" = ATE_adjusted, "bias_adjusted" = bias_adjusted)
-  return(rslt)
+  if (ncol(pred_raw) == n_obs) {
+    return(colMeans(pred_raw))
+  }
+  
+  stop("SL.dbarts: could not determine orientation of dbarts predictions.")
+}
+
+## Standardize design matrices so training and prediction always use
+## the same column names, same order, and numeric storage.
+.prepare_dbarts_xy <- function(X, newX = NULL) {
+  X <- as.data.frame(X)
+  X[] <- lapply(X, as.numeric)
+  
+  if (!is.null(newX)) {
+    newX <- as.data.frame(newX)
+    newX <- newX[, colnames(X), drop = FALSE]
+    newX[] <- lapply(newX, as.numeric)
+  }
+  
+  list(
+    X_df   = X,
+    X_mat  = as.matrix(X),
+    newX_df  = newX,
+    newX_mat = if (!is.null(newX)) as.matrix(newX) else NULL
+  )
 }
 
 
+## ------------------------------------------------------------------
+## Custom SuperLearner wrapper for dbarts
+## ------------------------------------------------------------------
+SL.dbarts <- function(Y, X, newX, family, obsWeights, id, ...) {
+  
+  ## This wrapper is for regression only
+  if (!identical(family$family, "gaussian")) {
+    stop("SL.dbarts currently supports gaussian outcomes only.")
+  }
+  
+  prep <- .prepare_dbarts_xy(X = X, newX = newX)
+  Y <- as.numeric(Y)
+  
+  ## Capture optional dbarts tuning arguments safely.
+  dbarts_args <- list(...)
+  if (is.null(dbarts_args$nthread) && is.null(dbarts_args$n.threads)) {
+    dbarts_args$nthread <- 1L
+  }
+  
+  ## Keep trees so predict() on the fitted bart object works later.
+  if (is.null(dbarts_args$keeptrees)) {
+    dbarts_args$keeptrees <- TRUE
+  }
+  
+  ## Fit dbarts using the matrix interface.
+  fit_obj <- do.call(
+    dbarts::bart,
+    c(
+      list(
+        x.train = prep$X_mat,
+        y.train = Y,
+        x.test  = prep$newX_mat,
+        verbose = FALSE
+      ),
+      dbarts_args
+    )
+  )
+  
+  ## Prefer the mean predictions if available; otherwise collapse draws.
+  pred <- if (!is.null(fit_obj$yhat.test.mean)) {
+    as.numeric(fit_obj$yhat.test.mean)
+  } else {
+    .reduce_dbarts_pred(fit_obj$yhat.test, n_obs = nrow(prep$newX_mat))
+  }
+  
+  out <- list(
+    pred = pred,
+    fit  = list(
+      object   = fit_obj,
+      colnames = colnames(prep$X_df)
+    )
+  )
+  
+  class(out$fit) <- "SL.dbarts"
+  out
+}
+
+
+## Prediction method used by predict.SuperLearner()
+predict.SL.dbarts <- function(object, newdata, ...) {
+  
+  ## Rebuild newdata in the exact training-column order.
+  newdata <- as.data.frame(newdata)
+  newdata <- newdata[, object$colnames, drop = FALSE]
+  newdata[] <- lapply(newdata, as.numeric)
+  x_test <- as.matrix(newdata)
+  
+  ## Predict from the fitted dbarts model.
+  pred_raw <- predict(object$object, newdata = x_test, ...)
+  
+  ## If predict() returns posterior draws, collapse to posterior mean.
+  .reduce_dbarts_pred(pred_raw, n_obs = nrow(x_test))
+}
+
+
+## ------------------------------------------------------------------
+# 6. Super Learner (SL)
+## ------------------------------------------------------------------
+super_one <- function(df = NULL, cl = NULL) {
+  
+  ## Build covariates and outcome.
+  X <- as.data.frame(df[, c(2, 3, 4, 5, 6), drop = FALSE])
+  X[] <- lapply(X, as.numeric)
+  Y <- as.numeric(df[, 1])
+  
+  ## The intervention step below assumes a treatment column named A exists.
+  if (!("A" %in% colnames(X))) {
+    stop("super_one: X must contain a treatment column named 'A'.")
+  }
+  sl_library <- c("SL.ranger", "SL.lm", "SL.dbarts", "SL.xgboost")
+  
+  ## Initialize workers once.
+  if (!is.null(cl)) {
+    parallel::clusterEvalQ(cl, {
+      library(SuperLearner)
+      library(dbarts)
+      library(ranger)
+      library(xgboost)
+      NULL
+    })
+    
+    ## Export the custom learner, predict method, and helpers.
+    parallel::clusterExport(
+      cl,
+      varlist = c(
+        "SL.dbarts",
+        "predict.SL.dbarts",
+        ".reduce_dbarts_pred",
+        ".prepare_dbarts_xy"
+      ),
+      envir = environment()
+    )
+  }
+  
+  ## Shared fitting helper.
+  fit_super <- function(sl_library) {
+    if (is.null(cl)) {
+      SuperLearner::SuperLearner(
+        Y          = Y,
+        X          = X,
+        family     = gaussian(),
+        SL.library = sl_library,
+        method     = "method.NNLS",
+        cvControl  = list(V = 10)
+      )
+    } else {
+      SuperLearner::snowSuperLearner(
+        Y          = Y,
+        X          = X,
+        family     = gaussian(),
+        SL.library = sl_library,
+        method     = "method.NNLS",
+        cvControl  = list(V = 10),
+        cluster    = cl
+      )
+    }
+  }
+  
+  all <- tryCatch(
+    fit_super(sl_library),
+    error = function(e) {
+      fit_super("SL.dbarts")
+    }
+  )
+  
+  df_A0 <- X
+  df_A0$A <- 0
+  df_A0 <- df_A0[, colnames(X), drop = FALSE]
+  
+  pred_A0 <- tryCatch(
+    predict.SuperLearner(object = all, newdata = df_A0, onlySL = TRUE),
+    error = function(e) {
+      all_local <- fit_super("SL.dbarts")
+      predict.SuperLearner(object = all_local, newdata = df_A0, onlySL = TRUE)
+    }
+  )
+  df_A1 <- X
+  df_A1$A <- 1
+  df_A1 <- df_A1[, colnames(X), drop = FALSE]
+  
+  pred_A1 <- tryCatch(
+    predict.SuperLearner(object = all, newdata = df_A1, onlySL = TRUE),
+    error = function(e) {
+      all_local <- fit_super("SL.dbarts")
+      predict.SuperLearner(object = all_local, newdata = df_A1, onlySL = TRUE)
+    }
+  )
+  ATE_adjusted  <- mean(pred_A1$pred - pred_A0$pred)
+  bias_adjusted <- ATE_adjusted - 50
+  
+  data.frame(
+    ATE_adjusted  = ATE_adjusted,
+    bias_adjusted = bias_adjusted
+  )
+}
+
 # 7. XGBoost
-xgboost_one <- function(df = NULL, min_n = 10, tree_depth = 9, learn_rate = 0.02, loss_reduction = 0){ 
+xgboost_one <- function(df = NULL, min_n = 10, tree_depth = 9, learn_rate = 0.02, loss_reduction = 0, ...){ 
 ## fit the model for all individuals with predictions for everyone
   xg_all <- parsnip::boost_tree(
     mode = "regression",
@@ -255,14 +433,24 @@ run_single_stage <- function(datasets, metadata, methods = NULL, use_parallel = 
 
   if (use_parallel) {
     doParallel::registerDoParallel(max(1, cores - 1))
+    `%op%` <- foreach::`%dopar%`
   } else {
-    doParallel::registerDoParallel(1)
+    foreach::registerDoSEQ()
+    `%op%` <- foreach::`%do%`
   }
   
 # helper function to run a single method across all datasets and compute the average metrics
   run_method <- function(method){
-    metrics <- foreach::foreach(i = seq_along(datasets), .combine = rbind) %dopar% {
-      res <- method$fit(datasets[[i]], cl = cl)
+    cat("Running method:", method$name, "\n")
+    metrics <- foreach::foreach(
+      i = seq_along(datasets),
+      .combine = rbind,
+      .packages = c("parsnip", "ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr"),
+      .export = c("SL.dbarts", "predict.SL.dbarts")
+    ) %op% {
+      df <- as.data.frame(datasets[[i]])
+      df[] <- lapply(df, function(x) if (is.factor(x)) as.numeric(as.character(x)) else x)
+      res <- method$fit(df, cl = cl)
       m <- extract_single_stage_metrics(res)
       c(estimate = m$estimate, bias = m$bias)
     }

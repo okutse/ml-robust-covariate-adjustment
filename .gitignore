@@ -50,15 +50,41 @@ rsconnect/
 
 # ignore the datasets from uploading to GitHub. Archived in Zenodo and available on request.
 simulations/complete_data/datasets/*.RData
+simulations/missing_outcomes/miss_datasets
 
 # ignore all .bash files from repository
-simulations/complete_data/scripts/*.bash
+simulations/complete_data/scripts/**/*.bash
 
-# ignore the manifest file from repository
-simulations/complete_data/complete_data_results/single_stage_input_manifest.csv
+# ignore complete-data manifests/checkpoints in procedure folders
+simulations/complete_data/complete_data_results/single_stage/input_manifest.csv
+simulations/complete_data/complete_data_results/two_stage/input_manifest.csv
+simulations/complete_data/complete_data_results/single_stage_cf/input_manifest.csv
+simulations/complete_data/complete_data_results/two_stage_cf/input_manifest.csv
+simulations/complete_data/complete_data_results/single_stage/checkpoint.csv
+simulations/complete_data/complete_data_results/two_stage/checkpoint.csv
+simulations/complete_data/complete_data_results/single_stage_cf/checkpoint.csv
+simulations/complete_data/complete_data_results/two_stage_cf/checkpoint.csv
+simulations/complete_data/complete_data_results/single_stage/single_stage_input_manifest.csv
+simulations/complete_data/complete_data_results/two_stage/two_stage_input_manifest.csv
+simulations/complete_data/complete_data_results/single_stage/single_stage_checkpoint.csv
+simulations/complete_data/complete_data_results/two_stage/two_stage_checkpoint.csv
+
+# local sanity checks
+tests/sanity/
 
 # renv artifacts
 renv/library/
 renv/staging/
 renv/python/
 renv/.cache/
+
+# Hide local logs
+logs/
+logs/missing_outcomes/
+
+# one-off reconciliation helper for legacy missing-outcomes outputs
+simulations/missing_outcomes/miss_scripts/reconcile_missing_outputs.R
+
+.positai
+
+.DS_Store
