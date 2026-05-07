@@ -1,0 +1,2 @@
+"replicate","Estimator","Procedure","ModelSpec","n_obs","estimate","bias","eif_var","eif_se","bootstrap_se","bootstrap_bias","bc_estimate","ci_lower","ci_upper","bc_ci_lower","bc_ci_upper","covered_true_95","covered_true_95_bc","reject_h0_effect","reject_h0_null","bootstrap_time_sec","replicate_time_sec","covered_mc_mean_95"
+1,"super","tmle","m1",512,53.5238581913818,3.5238581913818,87340.8664433526,9.34563354959698,NA,NA,NA,35.2067530214625,71.8409633613011,NA,NA,1,NA,0,1,NA,3.30682492256165,NA

@@ -1,0 +1,2 @@
+"replicate","Estimator","Procedure","ModelSpec","n_obs","estimate","bias","eif_var","eif_se","bootstrap_se","bootstrap_bias","bc_estimate","ci_lower","ci_upper","bc_ci_lower","bc_ci_upper","covered_true_95","covered_true_95_bc","reject_h0_effect","reject_h0_null","bootstrap_time_sec","replicate_time_sec","covered_mc_mean_95"
+1,"correct_model","single_stage","m1",512,50.8081819209692,0.808181920969176,NA,NA,NA,-4.32985138201302,55.1380333029822,NA,NA,NA,NA,NA,NA,NA,NA,0.00329399108886719,0.00662708282470703,NA

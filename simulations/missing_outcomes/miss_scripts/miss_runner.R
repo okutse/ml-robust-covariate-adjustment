@@ -214,6 +214,9 @@ run_all_models_for_dataset <- function(
   }
 
   results <- as.data.frame(results)
+  if (nrow(results) == 0) {
+    stop("No results were produced; check model registry configuration.")
+  }
   results$covered_mc_mean_95 <- NA_integer_
   safe_mean <- function(x) {
     if (all(is.na(x))) {
@@ -527,7 +530,7 @@ run_procedure_for_setting <- function(
             model_spec = model_spec,
             covariate_registry = covariate_registry,
             procedure_registry = procedure_registry,
-            model_registry = list(model_registry[[method_name]]),
+            model_registry = setNames(list(model_registry[[method_name]]), method_name),
             n_reps = reps_to_run,
             bootstrap_reps = bootstrap_reps,
             bootstrap_seed = bootstrap_seed,

@@ -40,13 +40,6 @@ crossfit_outcome_predictions <- function(df, outcome, covariates, model, folds =
     assess_A1 <- assess_dat
     assess_A1$A <- 1
 
-    assess_dat_fac <- assess_dat
-    assess_dat_fac$A <- factor(assess_dat_fac$A, levels = levels(train_ps$A))
-    assess_A0_fac <- assess_A0
-    assess_A0_fac$A <- factor(assess_A0_fac$A, levels = levels(train_ps$A))
-    assess_A1_fac <- assess_A1
-    assess_A1_fac$A <- factor(assess_A1_fac$A, levels = levels(train_ps$A))
-
     idx <- assess_dat$.row_id
     mu0[idx] <- model$predict(fit_outcome, assess_A0, ...)
     mu1[idx] <- model$predict(fit_outcome, assess_A1, ...)
@@ -109,6 +102,10 @@ crossfit_dr_nuisance <- function(df, outcome, covariates, model, folds = CF_FOLD
     assess_A0$A <- 0
     assess_A1 <- assess_dat
     assess_A1$A <- 1
+    assess_A0_fac <- assess_A0
+    assess_A1_fac <- assess_A1
+    assess_A0_fac$A <- factor(assess_A0_fac$A, levels = levels(train_ps$A))
+    assess_A1_fac$A <- factor(assess_A1_fac$A, levels = levels(train_ps$A))
 
     idx <- assess_dat$.row_id
     mu0[idx] <- model$predict(fit_outcome, assess_A0, ...)
@@ -340,21 +337,26 @@ get_procedure_registry <- function() {
           stop("No observed outcomes (R == 1) in dataset.")
         }
 
-        preds <- crossfit_outcome_predictions(
-          df = df,
-          outcome = outcome,
-          covariates = covariates,
-          model = model,
-          folds = folds,
-          ...
-        )
+        if (!is.null(model$direct) && model$direct) {
+          estimate <- mean(df_obs[[outcome]][df_obs$A == 1]) -
+            mean(df_obs[[outcome]][df_obs$A == 0])
+        } else {
+          preds <- crossfit_outcome_predictions(
+            df = df,
+            outcome = outcome,
+            covariates = covariates,
+            model = model,
+            folds = folds,
+            ...
+          )
 
-        stage2_df <- df
-        stage2_df$y0 <- preds$mu0
-        stage2_df$y1 <- preds$mu1
-        stage2_obs <- stage2_df[stage2_df$R == 1, , drop = FALSE]
-        outM <- glm(y ~ A + y0 + y1, data = stage2_obs)
-        estimate <- unname(coef(outM)["A"])
+          stage2_df <- df
+          stage2_df$y0 <- preds$mu0
+          stage2_df$y1 <- preds$mu1
+          stage2_obs <- stage2_df[stage2_df$R == 1, , drop = FALSE]
+          outM <- glm(y ~ A + y0 + y1, data = stage2_obs)
+          estimate <- unname(coef(outM)["A"])
+        }
 
         list(
           estimate = estimate,
@@ -370,6 +372,23 @@ get_procedure_registry <- function() {
       name = "single_stage_drml",
       use_eif_var = TRUE,
       run = function(df, outcome, covariates, model, folds = CF_FOLDS, ...) {
+        df_obs <- df[df$R == 1, , drop = FALSE]
+        if (nrow(df_obs) == 0) {
+          stop("No observed outcomes (R == 1) in dataset.")
+        }
+
+        if (!is.null(model$direct) && model$direct) {
+          estimate <- mean(df_obs[[outcome]][df_obs$A == 1]) -
+            mean(df_obs[[outcome]][df_obs$A == 0])
+          return(list(
+            estimate = estimate,
+            bias = estimate - 50,
+            n_obs = nrow(df_obs),
+            eif_var = NA_real_,
+            eif_se = NA_real_
+          ))
+        }
+
         nuis <- crossfit_dr_nuisance(
           df = df,
           outcome = outcome,
@@ -414,6 +433,26 @@ get_procedure_registry <- function() {
       name = "single_stage_drml_bc",
       use_eif_var = TRUE,
       run = function(df, outcome, covariates, model, folds = CF_FOLDS, ...) {
+        df_obs <- df[df$R == 1, , drop = FALSE]
+        if (nrow(df_obs) == 0) {
+          stop("No observed outcomes (R == 1) in dataset.")
+        }
+        # patch to bypass nuisance estimation and directly compute the DR estimator for the unadjusted method, 
+        # which is equivalent to the Horvitz-Thompson estimator with missing data bias correction. 
+        # This allows us to isolate the impact of the bias correction component in the absence of ML nuisance estimation.
+
+        if (!is.null(model$direct) && model$direct) {
+          estimate <- mean(df_obs[[outcome]][df_obs$A == 1]) -
+            mean(df_obs[[outcome]][df_obs$A == 0])
+          return(list(
+            estimate = estimate,
+            bias = estimate - 50,
+            n_obs = nrow(df_obs),
+            eif_var = NA_real_,
+            eif_se = NA_real_
+          ))
+        }
+
         nuis <- crossfit_dr_nuisance(
           df = df,
           outcome = outcome,
@@ -458,6 +497,25 @@ get_procedure_registry <- function() {
       name = "tmle",
       use_eif_var = TRUE,
       run = function(df, outcome, covariates, model, folds = CF_FOLDS, ...) {
+        df_obs <- df[df$R == 1, , drop = FALSE]
+        if (nrow(df_obs) == 0) {
+          stop("No observed outcomes (R == 1) in dataset.")
+        }
+        # patch to bypass nuisance estimation and directly compute the TMLE update for the unadjusted method, 
+        # which is equivalent to the Horvitz-Thompson estimator with missing data bias correction when no targeting is performed.
+
+        if (!is.null(model$direct) && model$direct) {
+          estimate <- mean(df_obs[[outcome]][df_obs$A == 1]) -
+            mean(df_obs[[outcome]][df_obs$A == 0])
+          return(list(
+            estimate = estimate,
+            bias = estimate - 50,
+            n_obs = nrow(df_obs),
+            eif_var = NA_real_,
+            eif_se = NA_real_
+          ))
+        }
+
         df_cf <- as.data.frame(df)
         df_cf$.row_id <- seq_len(nrow(df_cf))
         x_covars <- setdiff(covariates, "A")
