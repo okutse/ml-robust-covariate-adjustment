@@ -203,7 +203,7 @@ get_model_registry <- function() {
       name = "rf",
       fit = function(df_obs, outcome, covariates, ...) {
         formula <- build_formula(outcome, covariates)
-        rand_forest(trees = 500) %>%
+        rand_forest() %>%
           set_mode("regression") %>%
           set_engine("ranger") %>%
           fit(formula = formula, data = df_obs)
@@ -228,14 +228,7 @@ get_model_registry <- function() {
       name = "xgboost",
       fit = function(df_obs, outcome, covariates, ...) {
         formula <- build_formula(outcome, covariates)
-        parsnip::boost_tree(
-          mode = "regression",
-          trees = 1000,
-          min_n = 10,
-          tree_depth = 9,
-          learn_rate = 0.02,
-          loss_reduction = 0
-        ) %>%
+        parsnip::boost_tree(mode = "regression") %>%
           set_engine("xgboost", objective = "reg:squarederror") %>%
           fit(formula = formula, data = df_obs)
       },

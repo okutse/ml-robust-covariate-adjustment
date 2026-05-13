@@ -568,9 +568,32 @@ run_procedure_for_setting <- function(
       }
 
       method_files <- list.files(scenario_dir, pattern = "_results\\.csv$", full.names = TRUE)
+      scenario_file <- file.path(scenario_dir, paste0(scenario_name, "_results.csv"))
       if (length(method_files) > 0) {
         scenario_agg <- do.call(rbind, lapply(method_files, read.csv, stringsAsFactors = FALSE))
-        scenario_file <- file.path(scenario_dir, paste0(scenario_name, "_results.csv"))
+        if ("relative_efficiency" %in% names(scenario_agg)) {
+          lm_var <- scenario_agg$mc_var_estimate[scenario_agg$Estimator == "lm"]
+          if (length(lm_var) == 1 && !is.na(lm_var)) {
+            scenario_agg$relative_efficiency <- ifelse(
+              scenario_agg$mc_var_estimate > 0,
+              lm_var / scenario_agg$mc_var_estimate,
+              NA_real_
+            )
+          }
+        }
+        write.csv(scenario_agg, file = scenario_file, row.names = FALSE)
+      } else if (file.exists(scenario_file)) {
+        scenario_agg <- read.csv(scenario_file, stringsAsFactors = FALSE)
+        if ("relative_efficiency" %in% names(scenario_agg)) {
+          lm_var <- scenario_agg$mc_var_estimate[scenario_agg$Estimator == "lm"]
+          if (length(lm_var) == 1 && !is.na(lm_var)) {
+            scenario_agg$relative_efficiency <- ifelse(
+              scenario_agg$mc_var_estimate > 0,
+              lm_var / scenario_agg$mc_var_estimate,
+              NA_real_
+            )
+          }
+        }
         write.csv(scenario_agg, file = scenario_file, row.names = FALSE)
       }
 

@@ -24,8 +24,8 @@ bootstrap_seed <- 20260417
 # Allow dynamic control over how many replicates are processed per scenario.
 replicates_to_run <- as.integer(Sys.getenv("REPLICATES_TO_RUN", REPLICATES_DEFAULT))
 
-# Default to sequential execution so per-replicate progress logs stay ordered.
-use_parallel <- tolower(Sys.getenv("USE_PARALLEL", "false")) == "true"
+# Default to parallel execution; can be disabled by setting USE_PARALLEL=false.
+use_parallel <- tolower(Sys.getenv("USE_PARALLEL", "true")) == "true"
 
 load_data <- function(path) {
   env <- new.env(parent = emptyenv())
@@ -85,6 +85,31 @@ cat("Found", length(all_files), "files; remaining:", length(remaining), "\n")
 
 method_registry <- get_two_stage_cf_registry()
 method_names <- names(method_registry)
+
+recompute_relative_efficiency <- function(results) {
+  if (!is.data.frame(results) || nrow(results) == 0) {
+    return(results)
+  }
+  if (!"relative_efficiency" %in% names(results)) {
+    results$relative_efficiency <- NA_real_
+  }
+  var_col <- if ("mc_var_estimate" %in% names(results)) {
+    "mc_var_estimate"
+  } else if ("var_estimate" %in% names(results)) {
+    "var_estimate"
+  } else {
+    return(results)
+  }
+  lm_var <- results[results$Estimator == "lm", var_col]
+  if (length(lm_var) == 1 && !is.na(lm_var)) {
+    results$relative_efficiency <- ifelse(
+      results[[var_col]] > 0,
+      lm_var / results[[var_col]],
+      NA_real_
+    )
+  }
+  results
+}
 
 run_single_file <- function(file) {
   scenario_start <- Sys.time()
@@ -165,9 +190,14 @@ run_single_file <- function(file) {
 
   # Aggregate method-level files into a scenario-level summary after all methods complete.
   method_files <- list.files(scenario_dir, pattern = "_cf\\.csv$", full.names = TRUE)
+  scenario_file <- file.path(scenario_dir, paste0(scenario_name, "_results.csv"))
   if (length(method_files) > 0) {
     scenario_agg <- lapply(method_files, read.csv, stringsAsFactors = FALSE) %>% dplyr::bind_rows()
-    scenario_file <- file.path(scenario_dir, paste0(scenario_name, "_results.csv"))
+    scenario_agg <- recompute_relative_efficiency(scenario_agg)
+    write.csv(scenario_agg, scenario_file, row.names = FALSE)
+  } else if (file.exists(scenario_file)) {
+    scenario_agg <- read.csv(scenario_file, stringsAsFactors = FALSE)
+    scenario_agg <- recompute_relative_efficiency(scenario_agg)
     write.csv(scenario_agg, scenario_file, row.names = FALSE)
   }
 
