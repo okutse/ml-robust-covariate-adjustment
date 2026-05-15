@@ -181,6 +181,26 @@ pending_files <- input_files[!basename(input_files) %in% processed_files]
 
 cat("Running single-stage models on", length(pending_files), "scenario files.\n")
 
+merge_replicate_checkpoint <- function(existing, incoming) {
+  # Keep the latest status row per replicate when resuming.
+  if (is.null(existing) || nrow(existing) == 0) {
+    return(incoming)
+  }
+  combined <- rbind(existing, incoming)
+  combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
+  combined
+}
+
+merge_replicate_diagnostics <- function(existing, incoming) {
+  # De-duplicate by replicate, preferring the most recent diagnostics.
+  if (is.null(existing) || nrow(existing) == 0) {
+    return(incoming)
+  }
+  combined <- rbind(existing, incoming)
+  combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
+  combined
+}
+
 input_manifest <- data.frame(
   data_source = data_source,
   input_dir = normalizePath(input_dir, winslash = "/", mustWork = TRUE),
@@ -197,21 +217,140 @@ write.csv(
 results <- do.call(rbind, lapply(pending_files, function(file_path) {
   cat("Processing scenario:", basename(file_path), "\n")
   scenario <- load_scenario(file_path)
-  timing <- system.time({
-    results <- run_single_stage(
-      datasets = scenario$datasets,
-      metadata = scenario$metadata,
-      methods = get_single_stage_registry(),
-      use_parallel = TRUE,
-      cores = parallel::detectCores(logical = TRUE),
-      cl = NULL
-    )
-  })
-  cat("Completed scenario:", basename(file_path), "in", round(timing[["elapsed"]], 2), "seconds.\n")
-  # write per-scenario results before checkpointing
   scenario_name <- tools::file_path_sans_ext(basename(file_path))
+  scenario_dir <- file.path(scenario_output_dir, scenario_name)
+  if (!dir.exists(scenario_dir)) {
+    dir.create(scenario_dir, recursive = TRUE)
+  }
+
+  method_registry <- get_single_stage_registry()
+  method_names <- names(method_registry)
+  method_checkpoint <- file.path(scenario_dir, "method_checkpoint.csv")
+  if (file.exists(method_checkpoint)) {
+    method_cp <- read.csv(method_checkpoint, stringsAsFactors = FALSE)
+    completed_methods <- method_cp$method[method_cp$status == "done"]
+  } else {
+    method_cp <- data.frame(method = character(), status = character(), timestamp = character(), error = character(), stringsAsFactors = FALSE)
+    completed_methods <- character()
+  }
+
+  timing <- system.time({
+    for (method_name in method_names) {
+      if (method_name %in% completed_methods) {
+        cat("Skipping completed method:", method_name, "for", scenario_name, "\n")
+        next
+      }
+
+      method_rep_checkpoint <- file.path(scenario_dir, paste0(method_name, "_replicate_checkpoint.csv"))
+      method_diag_file <- file.path(scenario_dir, paste0(method_name, "_replicate_diagnostics.csv"))
+      method_file <- file.path(scenario_dir, paste0(method_name, ".csv"))
+
+      completed_reps <- integer(0)
+      rep_checkpoint <- NULL
+      if (file.exists(method_rep_checkpoint)) {
+        rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
+        completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
+      }
+      replicate_ids <- seq_len(length(scenario$datasets))
+      pending_reps <- setdiff(replicate_ids, completed_reps)
+      if (length(pending_reps) == 0) {
+        method_cp <- rbind(
+          method_cp,
+          data.frame(method = method_name, status = "done", timestamp = as.character(Sys.time()), error = "", stringsAsFactors = FALSE)
+        )
+        write.csv(method_cp, method_checkpoint, row.names = FALSE)
+        cat("Skipping completed method:", method_name, "for", scenario_name, "\n")
+        next
+      }
+
+      cat("Running method:", method_name, "for", scenario_name, "\n")
+      # Track total wall time per method for the scenario.
+      method_start <- Sys.time()
+      msg <- ""
+      status <- "done"
+      tryCatch({
+        res <- run_single_stage(
+          datasets = scenario$datasets[pending_reps],
+          metadata = scenario$metadata[pending_reps, , drop = FALSE],
+          methods = list(method_registry[[method_name]]),
+          use_parallel = TRUE,
+          cores = parallel::detectCores(logical = TRUE),
+          cl = NULL,
+          replicate_ids = pending_reps
+        )
+
+        diag_new <- attr(res, "replicate_diagnostics")
+        diag_existing <- NULL
+        if (file.exists(method_diag_file)) {
+          diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
+        }
+        diag_all <- merge_replicate_diagnostics(diag_existing, diag_new)
+        summary_res <- summarize_single_stage_metrics(diag_all)
+        # Persist diagnostics before marking checkpoints so resume has data to aggregate.
+        write.csv(diag_all, method_diag_file, row.names = FALSE)
+        write.csv(summary_res, method_file, row.names = FALSE)
+
+        rep_rows <- data.frame(
+          replicate = pending_reps,
+          status = "done",
+          timestamp = as.character(Sys.time()),
+          error = "",
+          stringsAsFactors = FALSE
+        )
+        rep_checkpoint <- merge_replicate_checkpoint(rep_checkpoint, rep_rows)
+        # Replicate checkpoint advances only after diagnostics + summary are saved.
+        write.csv(rep_checkpoint, method_rep_checkpoint, row.names = FALSE)
+      }, error = function(e) {
+        status <<- "error"
+        msg <<- conditionMessage(e)
+      })
+
+      if (status == "error") {
+        method_cp <- rbind(
+          method_cp,
+          data.frame(method = method_name, status = status, timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE)
+        )
+        write.csv(method_cp, method_checkpoint, row.names = FALSE)
+        stop(msg)
+      }
+
+      method_elapsed <- as.numeric(difftime(Sys.time(), method_start, units = "secs"))
+      cat("Running method:", method_name, "completed in", round(method_elapsed, 2), "sec\n")
+
+      rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
+      completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
+      if (length(completed_reps) == length(replicate_ids)) {
+        method_cp <- rbind(
+          method_cp,
+          data.frame(method = method_name, status = "done", timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE)
+        )
+        write.csv(method_cp, method_checkpoint, row.names = FALSE)
+        cat("Method checkpointed:", method_name, "for", scenario_name, "\n")
+      }
+    }
+  })
+
+  cat("Completed scenario:", basename(file_path), "in", round(timing[["elapsed"]], 2), "seconds.\n")
+
+  method_files <- file.path(scenario_dir, paste0(method_names, ".csv"))
+  method_files <- method_files[file.exists(method_files)]
   scenario_csv <- file.path(scenario_output_dir, paste0(scenario_name, ".csv"))
-  write.csv(results, file = scenario_csv, row.names = FALSE)
+  if (length(method_files) > 0) {
+    scenario_results <- do.call(rbind, lapply(method_files, read.csv, stringsAsFactors = FALSE))
+    scenario_results$n <- scenario$metadata$n[1]
+    scenario_results$target_r2 <- scenario$metadata$target_r2[1]
+    scenario_results$achieved_r2_raw <- mean(scenario$metadata$achieved_r2_raw)
+    scenario_results$ss <- mean(scenario$metadata$ss)
+    # Relative efficiency uses the Monte Carlo variance relative to lm.
+    lm_var <- scenario_results$var_estimate[scenario_results$Estimator == "lm"]
+    scenario_results$relative_efficiency <- ifelse(
+      scenario_results$var_estimate > 0,
+      lm_var / scenario_results$var_estimate,
+      NA
+    )
+    write.csv(scenario_results, file = scenario_csv, row.names = FALSE)
+  }
+
   write.table(
     data.frame(file = basename(file_path), stringsAsFactors = FALSE),
     file = checkpoint_path,
@@ -221,7 +360,10 @@ results <- do.call(rbind, lapply(pending_files, function(file_path) {
     row.names = FALSE
   )
   cat("Checkpointed scenario:", basename(file_path), "\n")
-  results
+  if (length(method_files) > 0) {
+    return(scenario_results)
+  }
+  data.frame()
 }))
 
 # aggregate all per-scenario results into a single output

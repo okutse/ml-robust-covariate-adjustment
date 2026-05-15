@@ -41,6 +41,7 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 log_dir <- file.path("logs", "complete_data", procedure_name)
 dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
 log_file <- file.path(log_dir, sprintf("%s_%s.log", procedure_name, format(Sys.time(), "%Y%m%d_%H%M%S")))
+log_file <- normalizePath(log_file, mustWork = FALSE)
 cat("Logging to:", log_file, "\n")
 # Mirror console output to the log file for reproducibility and auditability.
 sink(log_file, append = TRUE, split = TRUE)
@@ -86,7 +87,45 @@ cat("Found", length(all_files), "files; remaining:", length(remaining), "\n")
 method_registry <- get_two_stage_cf_registry()
 method_names <- names(method_registry)
 
+merge_replicate_checkpoint <- function(existing, incoming) {
+  # Keep the latest status row per replicate when resuming.
+  if (is.null(existing) || nrow(existing) == 0) {
+    return(incoming)
+  }
+  combined <- dplyr::bind_rows(existing, incoming)
+  combined <- combined %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::slice_tail(n = 1) %>%
+    dplyr::ungroup()
+  combined
+}
+
+merge_replicate_diagnostics <- function(existing, incoming) {
+  # De-duplicate by replicate, preferring the most recent diagnostics.
+  if (is.null(existing) || nrow(existing) == 0) {
+    return(incoming)
+  }
+  combined <- dplyr::bind_rows(existing, incoming)
+  combined <- combined %>%
+    dplyr::group_by(replicate) %>%
+    dplyr::slice_tail(n = 1) %>%
+    dplyr::ungroup()
+  combined
+}
+
+read_cached_replicate_diagnostics <- function(method_progress_dir) {
+  if (is.null(method_progress_dir) || !dir.exists(method_progress_dir)) {
+    return(NULL)
+  }
+  files <- list.files(method_progress_dir, pattern = "^replicate_\\d+\\.csv$", full.names = TRUE)
+  if (length(files) == 0) {
+    return(NULL)
+  }
+  dplyr::bind_rows(lapply(files, read.csv, stringsAsFactors = FALSE))
+}
+
 recompute_relative_efficiency <- function(results) {
+  # Recompute relative efficiency from Monte Carlo variance in per-scenario aggregates.
   if (!is.data.frame(results) || nrow(results) == 0) {
     return(results)
   }
@@ -117,6 +156,7 @@ run_single_file <- function(file) {
   scenario_name <- sub("\\.RData$", "", basename(file))
   scenario_dir <- file.path(output_dir, scenario_name)
   dir.create(scenario_dir, recursive = TRUE, showWarnings = FALSE)
+  scenario_progress_dir <- normalizePath(file.path(scenario_dir, "replicate_cache"), mustWork = FALSE)
 
   reps_requested <- if (is.na(replicates_to_run)) REPLICATES_DEFAULT else replicates_to_run
   reps_to_run <- min(length(ld$datasets), reps_requested)
@@ -145,31 +185,85 @@ run_single_file <- function(file) {
       next
     }
 
+    method_rep_checkpoint <- file.path(scenario_dir, paste0(method_name, "_replicate_checkpoint.csv"))
+    method_diag_file <- file.path(scenario_dir, paste0(method_name, "_replicate_diagnostics.csv"))
+    method_file <- file.path(scenario_dir, paste0(method_name, "_cf.csv"))
+
+    cached_diag <- read_cached_replicate_diagnostics(file.path(scenario_progress_dir, method_name))
+    if (!is.null(cached_diag)) {
+      diag_existing <- NULL
+      if (file.exists(method_diag_file)) {
+        diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
+      }
+      diag_all_cached <- merge_replicate_diagnostics(diag_existing, cached_diag)
+      write.csv(diag_all_cached, method_diag_file, row.names = FALSE)
+    }
+
+    completed_reps <- integer(0)
+    rep_checkpoint <- NULL
+    if (file.exists(method_rep_checkpoint)) {
+      rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
+      completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
+    }
+    if (!is.null(cached_diag) && "replicate" %in% names(cached_diag)) {
+      completed_reps <- unique(c(completed_reps, cached_diag$replicate))
+    }
+    replicate_ids <- seq_len(reps_to_run)
+    pending_reps <- setdiff(replicate_ids, completed_reps)
+    if (length(pending_reps) == 0) {
+      method_cp <- rbind(
+        method_cp,
+        data.frame(method = method_name, status = "done", timestamp = as.character(Sys.time()), error = "", stringsAsFactors = FALSE)
+      )
+      write.csv(method_cp, method_checkpoint, row.names = FALSE)
+      method_cache_dir <- file.path(scenario_progress_dir, method_name)
+      if (dir.exists(method_cache_dir)) {
+        unlink(method_cache_dir, recursive = TRUE, force = TRUE)
+      }
+      cat("Skipping completed method:", method_name, "for", scenario_name, "\n")
+      next
+    }
+
     cat("Running method:", method_name, "for", scenario_name, "\n")
     method_start <- Sys.time()
     msg <- ""
     status <- "done"
     tryCatch({
       res <- run_two_stage_cf(
-        datasets = ld$datasets,
-        metadata = ld$metadata,
+        datasets = ld$datasets[pending_reps],
+        metadata = ld$metadata[pending_reps, , drop = FALSE],
         methods = list(method_registry[[method_name]]),
         use_parallel = use_parallel,
         n_reps = reps_to_run,
         bootstrap_reps = bootstrap_reps,
-        bootstrap_seed = bootstrap_seed
+        bootstrap_seed = bootstrap_seed,
+        replicate_ids = pending_reps,
+        progress_dir = scenario_progress_dir,
+        log_file = log_file
       )
 
-      # Write method-level results to a dedicated file before checkpointing.
-      method_file <- file.path(scenario_dir, paste0(method_name, "_cf.csv"))
-      write.csv(res, method_file, row.names = FALSE)
-
-      # Persist replicate-level diagnostics for this method and scenario.
-      diag <- attr(res, "replicate_diagnostics")
-      if (!is.null(diag) && nrow(diag) > 0) {
-        diag_file <- file.path(scenario_dir, paste0(method_name, "_replicate_diagnostics.csv"))
-        write.csv(diag, diag_file, row.names = FALSE)
+      diag_new <- attr(res, "replicate_diagnostics")
+      diag_existing <- NULL
+      if (file.exists(method_diag_file)) {
+        diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
       }
+      diag_all <- merge_replicate_diagnostics(diag_existing, diag_new)
+      summary_res <- summarize_two_stage_cf_metrics(diag_all)
+      diag_all <- summary_res$diagnostics
+      # Persist diagnostics before marking checkpoints so resume has data to aggregate.
+      write.csv(diag_all, method_diag_file, row.names = FALSE)
+      write.csv(summary_res$summary, method_file, row.names = FALSE)
+
+      rep_rows <- data.frame(
+        replicate = pending_reps,
+        status = "done",
+        timestamp = as.character(Sys.time()),
+        error = "",
+        stringsAsFactors = FALSE
+      )
+      rep_checkpoint <- merge_replicate_checkpoint(rep_checkpoint, rep_rows)
+      # Replicate checkpoint advances only after diagnostics + summary are saved.
+      write.csv(rep_checkpoint, method_rep_checkpoint, row.names = FALSE)
     }, error = function(e) {
       status <<- "error"
       msg <<- conditionMessage(e)
@@ -178,13 +272,29 @@ run_single_file <- function(file) {
     method_elapsed <- as.numeric(difftime(Sys.time(), method_start, units = "secs"))
     cat("Running method:", method_name, "completed in", round(method_elapsed, 2), "sec\n")
 
-    # Checkpoint after method outputs are saved so resuming is safe.
-    method_cp <- rbind(method_cp, data.frame(method = method_name, status = status, timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE))
-    write.csv(method_cp, method_checkpoint, row.names = FALSE)
-    cat("Method checkpointed:", method_name, "for", scenario_name, "\n")
-
     if (status == "error") {
+      method_cp <- rbind(
+        method_cp,
+        data.frame(method = method_name, status = status, timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE)
+      )
+      write.csv(method_cp, method_checkpoint, row.names = FALSE)
+      cat("Method checkpointed:", method_name, "for", scenario_name, "\n")
       stop(msg)
+    }
+
+    rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
+    completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
+    if (length(completed_reps) == length(replicate_ids)) {
+      method_cp <- rbind(
+        method_cp,
+        data.frame(method = method_name, status = "done", timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE)
+      )
+      write.csv(method_cp, method_checkpoint, row.names = FALSE)
+      method_cache_dir <- file.path(scenario_progress_dir, method_name)
+      if (dir.exists(method_cache_dir)) {
+        unlink(method_cache_dir, recursive = TRUE, force = TRUE)
+      }
+      cat("Method checkpointed:", method_name, "for", scenario_name, "\n")
     }
   }
 

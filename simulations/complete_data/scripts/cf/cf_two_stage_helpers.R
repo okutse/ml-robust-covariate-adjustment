@@ -11,6 +11,48 @@ if (!exists("%>%")) {
   `%>%` <- magrittr::`%>%`
 }
 
+ensure_dir <- function(path) {
+  if (!is.null(path) && nzchar(path) && !dir.exists(path)) {
+    dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  }
+}
+
+log_progress_line <- function(log_file, line) {
+  cat(line, "\n")
+  if (sink.number() > 0) {
+    return(invisible(NULL))
+  }
+  if (!is.null(log_file) && nzchar(log_file)) {
+    cat(line, "\n", file = log_file, append = TRUE)
+  }
+}
+
+write_replicate_cache <- function(method_dir, rep_row) {
+  if (is.null(method_dir) || !nzchar(method_dir)) {
+    return(invisible(NULL))
+  }
+  ensure_dir(method_dir)
+  cache_file <- file.path(method_dir, sprintf("replicate_%s.csv", rep_row$replicate))
+  write.csv(rep_row, cache_file, row.names = FALSE)
+
+  checkpoint_file <- file.path(method_dir, "replicate_checkpoint.csv")
+  checkpoint_row <- data.frame(
+    replicate = rep_row$replicate,
+    status = "done",
+    timestamp = as.character(Sys.time()),
+    error = "",
+    stringsAsFactors = FALSE
+  )
+  if (file.exists(checkpoint_file)) {
+    existing <- read.csv(checkpoint_file, stringsAsFactors = FALSE)
+    combined <- rbind(existing, checkpoint_row)
+    combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
+    write.csv(combined, checkpoint_file, row.names = FALSE)
+  } else {
+    write.csv(checkpoint_row, checkpoint_file, row.names = FALSE)
+  }
+}
+
 unadj_cf <- function(df = NULL) {
   est <- mean(df$y[df$A == 1]) - mean(df$y[df$A == 0])
   data.frame(full_unadjusted = est, full_bias_unadjusted = est - 50)
@@ -210,6 +252,52 @@ extract_two_stage_metrics_cf <- function(res) {
   stop("Unknown result structure from estimator.")
 }
 
+summarize_two_stage_cf_metrics <- function(metrics) {
+  # Aggregate replicate-level diagnostics into a single method summary.
+  metrics <- as.data.frame(metrics)
+  if (nrow(metrics) == 0) {
+    stop("No replicate diagnostics available to summarize.")
+  }
+
+  mc_mean_estimate <- mean(metrics$estimate)
+  metrics$covered_mc_mean_95 <- as.integer(
+    metrics$ci_lower <= mc_mean_estimate & mc_mean_estimate <= metrics$ci_upper
+  )
+
+  mc_sd_estimate <- stats::sd(metrics$estimate)
+  mc_var_estimate <- stats::var(metrics$estimate)
+  mc_se_estimate <- mc_sd_estimate / sqrt(nrow(metrics))
+
+  summary <- data.frame(
+    Estimator = metrics$Estimator[1],
+    mean_estimate = mean(metrics$estimate),
+    mean_bias = mean(metrics$bias),
+    mc_sd_estimate = mc_sd_estimate,
+    mc_var_estimate = mc_var_estimate,
+    mc_se_estimate = mc_se_estimate,
+    # Backward-compatible aliases: these remain Monte Carlo quantities.
+    sd_estimate = mc_sd_estimate,
+    var_estimate = mc_var_estimate,
+    mean_bootstrap_se = mean(metrics$bootstrap_se),
+    sd_bootstrap_se = stats::sd(metrics$bootstrap_se),
+    mean_bootstrap_bias = mean(metrics$bootstrap_bias),
+    coverage_95 = mean(metrics$covered_true_95),
+    coverage_95_mc_mean = mean(metrics$covered_mc_mean_95),
+    coverage_95_bc = mean(metrics$covered_true_95_bc),
+    reject_h0_effect_prob = mean(metrics$reject_h0_effect),
+    reject_h0_null_prob = mean(metrics$reject_h0_null),
+    mean_ci_lower = mean(metrics$ci_lower),
+    mean_ci_upper = mean(metrics$ci_upper),
+    mean_bc_ci_lower = mean(metrics$bc_ci_lower),
+    mean_bc_ci_upper = mean(metrics$bc_ci_upper),
+    mean_bootstrap_time_sec = mean(metrics$bootstrap_time_sec),
+    mean_replicate_time_sec = mean(metrics$replicate_time_sec),
+    stringsAsFactors = FALSE
+  )
+
+  list(summary = summary, diagnostics = metrics)
+}
+
 run_two_stage_cf <- function(
   datasets,
   metadata,
@@ -222,7 +310,10 @@ run_two_stage_cf <- function(
   bootstrap_seed = 20260417,
   true_effect = 50,
   null_effect = 0,
-  ci_level = 0.95
+  ci_level = 0.95,
+  replicate_ids = NULL,
+  progress_dir = NULL,
+  log_file = NULL
 ) {
   if (length(datasets) == 0) {
     stop("No datasets supplied.")
@@ -230,7 +321,17 @@ run_two_stage_cf <- function(
   if (length(datasets) != nrow(metadata)) {
     stop("Mismatch between datasets and metadata.")
   }
-  if (!is.null(n_reps)) {
+  # Support resuming on a subset of replicates when checkpoints exist.
+  if (!is.null(replicate_ids)) {
+    if (!is.numeric(replicate_ids) || any(is.na(replicate_ids))) {
+      stop("replicate_ids must be a numeric vector of replicate indices.")
+    }
+    if (any(replicate_ids < 1) || any(replicate_ids > length(datasets))) {
+      stop("replicate_ids contain indices outside the available dataset range.")
+    }
+    datasets <- datasets[replicate_ids]
+    metadata <- metadata[replicate_ids, , drop = FALSE]
+  } else if (!is.null(n_reps)) {
     if (!is.numeric(n_reps) || length(n_reps) != 1 || is.na(n_reps) || n_reps < 1) {
       stop("n_reps must be a single positive number.")
     }
@@ -238,6 +339,9 @@ run_two_stage_cf <- function(
     # Subset inputs so the caller can run fewer replicates than are stored on disk.
     datasets <- datasets[seq_len(n_keep)]
     metadata <- metadata[seq_len(n_keep), , drop = FALSE]
+    replicate_ids <- seq_len(n_keep)
+  } else {
+    replicate_ids <- seq_len(length(datasets))
   }
   if (is.null(methods)) {
     methods <- get_two_stage_cf_registry()
@@ -261,14 +365,27 @@ run_two_stage_cf <- function(
 
   run_method <- function(method) {
     cat("Running CF method:", method$name, "\n")
+    method_progress_dir <- NULL
+    if (!is.null(progress_dir) && nzchar(progress_dir)) {
+      method_progress_dir <- file.path(progress_dir, method$name)
+      ensure_dir(method_progress_dir)
+    }
     metrics <- foreach::foreach(
       i = seq_along(datasets),
       .combine = rbind,
       .packages = c("parsnip", "ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr", "rsample")
     ) %op% {
+      rep_id <- replicate_ids[i]
       # Emit per-replicate progress only in sequential mode to keep logs ordered and readable.
       if (!use_parallel) {
-        cat("Running method:", method$name, "replicate", i, "of", length(datasets), "\n")
+        cat("Running method:", method$name, "replicate", rep_id, "of", length(datasets), "\n")
+      } else {
+        log_progress_line(log_file, sprintf(
+          "Running method: %s replicate %s of %s",
+          method$name,
+          rep_id,
+          length(datasets)
+        ))
       }
       # Per-replicate timing tracks full runtime (point estimate + bootstrap) for this method.
       rep_time_start <- Sys.time()
@@ -288,7 +405,7 @@ run_two_stage_cf <- function(
 
       # Bootstrap timing is tracked separately to quantify the overhead of model-based SE estimation.
       boot_time_start <- Sys.time()
-      set.seed(bootstrap_seed + i)
+      set.seed(bootstrap_seed + rep_id)
       boot_estimates <- vapply(seq_len(bootstrap_reps), function(b) {
         # Best practice: resample rows and rerun the entire estimator (including nuisance cross-fitting).
         idx <- sample.int(nrow(df), size = nrow(df), replace = TRUE)
@@ -318,12 +435,9 @@ run_two_stage_cf <- function(
 
       total_rep_time_sec <- as.numeric(difftime(Sys.time(), rep_time_start, units = "secs"))
 
-      if (!use_parallel) {
-        cat("Running method:", method$name, "replicate", i, "completed in", round(total_rep_time_sec, 3), "sec\n")
-      }
-
-      c(
-        replicate = i,
+      rep_row <- data.frame(
+        replicate = rep_id,
+        Estimator = method$name,
         estimate = point_estimate,
         bias = point_bias,
         bootstrap_se = bootstrap_se,
@@ -338,50 +452,30 @@ run_two_stage_cf <- function(
         reject_h0_effect = reject_h0_effect,
         reject_h0_null = reject_h0_null,
         bootstrap_time_sec = bootstrap_time_sec,
-        replicate_time_sec = total_rep_time_sec
+        replicate_time_sec = total_rep_time_sec,
+        stringsAsFactors = FALSE
       )
+
+      write_replicate_cache(method_progress_dir, rep_row)
+
+      if (!use_parallel) {
+        cat("Running method:", method$name, "replicate", rep_id, "completed in", round(total_rep_time_sec, 3), "sec\n")
+      } else {
+        log_progress_line(log_file, sprintf(
+          "Running method: %s replicate %s completed in %s sec",
+          method$name,
+          rep_id,
+          round(total_rep_time_sec, 3)
+        ))
+      }
+
+      rep_row
     }
 
-    metrics <- as.data.frame(metrics)
-    # Bias-corrected coverage (Morris et al. 2019): CI contains the MC mean estimate.
-    mc_mean_estimate <- mean(metrics$estimate)
-    metrics$covered_mc_mean_95 <- as.integer(
-      metrics$ci_lower <= mc_mean_estimate & mc_mean_estimate <= metrics$ci_upper
-    )
     metrics$Estimator <- method$name
-    diagnostics_by_method[[method$name]] <<- metrics
-
-    # Empirical Monte Carlo variability is kept separate from model-based (bootstrap) SE summaries.
-    mc_sd_estimate <- stats::sd(metrics$estimate)
-    mc_var_estimate <- stats::var(metrics$estimate)
-    mc_se_estimate <- mc_sd_estimate / sqrt(nrow(metrics))
-
-    data.frame(
-      Estimator = method$name,
-      mean_estimate = mean(metrics$estimate),
-      mean_bias = mean(metrics$bias),
-      mc_sd_estimate = mc_sd_estimate,
-      mc_var_estimate = mc_var_estimate,
-      mc_se_estimate = mc_se_estimate,
-      # Backward-compatible aliases: these remain Monte Carlo quantities.
-      sd_estimate = mc_sd_estimate,
-      var_estimate = mc_var_estimate,
-      mean_bootstrap_se = mean(metrics$bootstrap_se),
-      sd_bootstrap_se = stats::sd(metrics$bootstrap_se),
-      mean_bootstrap_bias = mean(metrics$bootstrap_bias),
-      coverage_95 = mean(metrics$covered_true_95),
-      coverage_95_mc_mean = mean(metrics$covered_mc_mean_95),
-      coverage_95_bc = mean(metrics$covered_true_95_bc),
-      reject_h0_effect_prob = mean(metrics$reject_h0_effect),
-      reject_h0_null_prob = mean(metrics$reject_h0_null),
-      mean_ci_lower = mean(metrics$ci_lower),
-      mean_ci_upper = mean(metrics$ci_upper),
-      mean_bc_ci_lower = mean(metrics$bc_ci_lower),
-      mean_bc_ci_upper = mean(metrics$bc_ci_upper),
-      mean_bootstrap_time_sec = mean(metrics$bootstrap_time_sec),
-      mean_replicate_time_sec = mean(metrics$replicate_time_sec),
-      stringsAsFactors = FALSE
-    )
+    summary_res <- summarize_two_stage_cf_metrics(metrics)
+    diagnostics_by_method[[method$name]] <<- summary_res$diagnostics
+    summary_res$summary
   }
 
   results <- do.call(rbind, lapply(methods, run_method))

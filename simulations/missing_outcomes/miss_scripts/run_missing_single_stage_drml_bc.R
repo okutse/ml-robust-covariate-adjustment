@@ -27,3 +27,11 @@ run_procedure_for_setting(
 # Example run:
 # SETTING=setting1 DATA_SOURCE=local RESET_CHECKPOINT=true \
 # Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R
+
+# Slurm one-liner example (adjust partition/resources as needed):
+# sbatch --job-name=miss_single_stage_drml_bc --partition=gpu --gres=gpu:0 --nodes=1 \
+#   --ntasks=1 --cpus-per-task=10 --mem=64G --time=48:00:00 \
+#   --output=logs/missing_outcomes/single_stage_drml_bc_%A.out \
+#   --error=logs/missing_outcomes/single_stage_drml_bc_%A.err \
+#   --export=SETTING=setting1,DATA_SOURCE=local,RESET_CHECKPOINT=true \
+#   --wrap="module load r/4.5.1 && Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R"

@@ -253,7 +253,8 @@ super_one <- function(df = NULL, cl = NULL) {
   if (!("A" %in% colnames(X))) {
     stop("super_one: X must contain a treatment column named 'A'.")
   }
-  sl_library <- c("SL.ranger", "SL.lm", "SL.dbarts", "SL.xgboost")
+  ## Candidate learner library (exclude BART to keep runtime manageable).
+  sl_library <- c("SL.ranger", "SL.lm", "SL.xgboost")
   
   ## Initialize workers once.
   if (!is.null(cl)) {
@@ -302,35 +303,18 @@ super_one <- function(df = NULL, cl = NULL) {
     }
   }
   
-  all <- tryCatch(
-    fit_super(sl_library),
-    error = function(e) {
-      fit_super("SL.dbarts")
-    }
-  )
+  all <- fit_super(sl_library)
   
   df_A0 <- X
   df_A0$A <- 0
   df_A0 <- df_A0[, colnames(X), drop = FALSE]
   
-  pred_A0 <- tryCatch(
-    predict.SuperLearner(object = all, newdata = df_A0, onlySL = TRUE),
-    error = function(e) {
-      all_local <- fit_super("SL.dbarts")
-      predict.SuperLearner(object = all_local, newdata = df_A0, onlySL = TRUE)
-    }
-  )
+  pred_A0 <- predict.SuperLearner(object = all, newdata = df_A0, onlySL = TRUE)
   df_A1 <- X
   df_A1$A <- 1
   df_A1 <- df_A1[, colnames(X), drop = FALSE]
   
-  pred_A1 <- tryCatch(
-    predict.SuperLearner(object = all, newdata = df_A1, onlySL = TRUE),
-    error = function(e) {
-      all_local <- fit_super("SL.dbarts")
-      predict.SuperLearner(object = all_local, newdata = df_A1, onlySL = TRUE)
-    }
-  )
+  pred_A1 <- predict.SuperLearner(object = all, newdata = df_A1, onlySL = TRUE)
   ATE_adjusted  <- mean(pred_A1$pred - pred_A0$pred)
   bias_adjusted <- ATE_adjusted - 50
   
@@ -416,8 +400,33 @@ extract_single_stage_metrics <- function(res){
 
 
 
+summarize_single_stage_metrics <- function(metrics) {
+  # Aggregate replicate-level diagnostics into a single method summary.
+  metrics <- as.data.frame(metrics)
+  if (nrow(metrics) == 0) {
+    stop("No replicate diagnostics available to summarize.")
+  }
+
+  data.frame(
+    Estimator = metrics$Estimator[1],
+    mean_estimate = mean(metrics$estimate),
+    mean_bias = mean(metrics$bias),
+    sd_estimate = stats::sd(metrics$estimate),
+    var_estimate = stats::var(metrics$estimate),
+    stringsAsFactors = FALSE
+  )
+}
+
 # runs all single-stage methods on the list of datasets and returns averaged results
-run_single_stage <- function(datasets, metadata, methods = NULL, use_parallel = TRUE, cores = NULL, cl = NULL){
+run_single_stage <- function(
+  datasets,
+  metadata,
+  methods = NULL,
+  use_parallel = TRUE,
+  cores = NULL,
+  cl = NULL,
+  replicate_ids = NULL
+){
   if (length(datasets) == 0) {
     stop("No datasets supplied.")
   }
@@ -426,6 +435,19 @@ run_single_stage <- function(datasets, metadata, methods = NULL, use_parallel = 
   }
   if (is.null(methods)) {
     methods <- get_single_stage_registry()
+  }
+  # Support resuming on a subset of replicates when checkpoints exist.
+  if (!is.null(replicate_ids)) {
+    if (!is.numeric(replicate_ids) || any(is.na(replicate_ids))) {
+      stop("replicate_ids must be a numeric vector of replicate indices.")
+    }
+    if (any(replicate_ids < 1) || any(replicate_ids > length(datasets))) {
+      stop("replicate_ids contain indices outside the available dataset range.")
+    }
+    datasets <- datasets[replicate_ids]
+    metadata <- metadata[replicate_ids, , drop = FALSE]
+  } else {
+    replicate_ids <- seq_len(length(datasets))
   }
   if (is.null(cores)) {
     cores <- parallel::detectCores(logical = TRUE)
@@ -440,6 +462,8 @@ run_single_stage <- function(datasets, metadata, methods = NULL, use_parallel = 
   }
   
 # helper function to run a single method across all datasets and compute the average metrics
+  # Capture replicate-level diagnostics for persistence by callers.
+  diagnostics_by_method <- list()
   run_method <- function(method){
     cat("Running method:", method$name, "\n")
     metrics <- foreach::foreach(
@@ -448,21 +472,23 @@ run_single_stage <- function(datasets, metadata, methods = NULL, use_parallel = 
       .packages = c("parsnip", "ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr"),
       .export = c("SL.dbarts", "predict.SL.dbarts")
     ) %op% {
+      rep_id <- replicate_ids[i]
+      # Emit per-replicate timing only in sequential mode to keep logs readable.
+      rep_time_start <- Sys.time()
       df <- as.data.frame(datasets[[i]])
       df[] <- lapply(df, function(x) if (is.factor(x)) as.numeric(as.character(x)) else x)
       res <- method$fit(df, cl = cl)
       m <- extract_single_stage_metrics(res)
-      c(estimate = m$estimate, bias = m$bias)
+      if (!use_parallel) {
+        rep_time_sec <- as.numeric(difftime(Sys.time(), rep_time_start, units = "secs"))
+        cat("Running method:", method$name, "replicate", rep_id, "completed in", round(rep_time_sec, 3), "sec\n")
+      }
+      c(replicate = rep_id, estimate = m$estimate, bias = m$bias)
     }
-
-    data.frame(
-      Estimator = method$name,
-      mean_estimate = mean(metrics[, "estimate"]),
-      mean_bias = mean(metrics[, "bias"]),
-      sd_estimate = sd(metrics[, "estimate"]),
-      var_estimate = var(metrics[, "estimate"]),
-      stringsAsFactors = FALSE
-    )
+    metrics <- as.data.frame(metrics)
+    metrics$Estimator <- method$name
+    diagnostics_by_method[[method$name]] <<- metrics
+    summarize_single_stage_metrics(metrics)
   }
 
   results <- do.call(rbind, lapply(methods, run_method))
@@ -479,5 +505,6 @@ run_single_stage <- function(datasets, metadata, methods = NULL, use_parallel = 
     NA
   )
 
+  attr(results, "replicate_diagnostics") <- do.call(rbind, diagnostics_by_method)
   results
 }

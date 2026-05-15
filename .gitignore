@@ -53,7 +53,7 @@ simulations/complete_data/datasets/*.RData
 simulations/missing_outcomes/miss_datasets/
 
 # ignore all .bash files from repository
-simulations/complete_data/scripts/**/*.bash
+simulations/missing_outcomes/miss_scripts/miss_bash_scripts/*.bash
 
 # ignore complete-data manifests/checkpoints in procedure folders
 simulations/complete_data/complete_data_results/single_stage/input_manifest.csv

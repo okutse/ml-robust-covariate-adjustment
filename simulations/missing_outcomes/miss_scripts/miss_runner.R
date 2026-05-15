@@ -11,6 +11,55 @@ TRUE_EFFECT_DEFAULT <- as.numeric(Sys.getenv("TRUE_EFFECT", 50))
 NULL_EFFECT_DEFAULT <- as.numeric(Sys.getenv("NULL_EFFECT", 0))
 CI_LEVEL_DEFAULT <- as.numeric(Sys.getenv("CI_LEVEL", 0.95))
 
+log_progress_line <- function(log_file, line) {
+  cat(line, "\n")
+  if (sink.number() > 0) {
+    return(invisible(NULL))
+  }
+  if (!is.null(log_file) && nzchar(log_file)) {
+    cat(line, "\n", file = log_file, append = TRUE)
+  }
+}
+
+write_replicate_cache <- function(method_dir, rep_row) {
+  if (is.null(method_dir) || !nzchar(method_dir)) {
+    return(invisible(NULL))
+  }
+  if (!dir.exists(method_dir)) {
+    dir.create(method_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  cache_file <- file.path(method_dir, sprintf("replicate_%s.csv", rep_row$replicate))
+  write.csv(rep_row, cache_file, row.names = FALSE)
+
+  checkpoint_file <- file.path(method_dir, "replicate_checkpoint.csv")
+  checkpoint_row <- data.frame(
+    replicate = rep_row$replicate,
+    status = "done",
+    timestamp = as.character(Sys.time()),
+    error = "",
+    stringsAsFactors = FALSE
+  )
+  if (file.exists(checkpoint_file)) {
+    existing <- read.csv(checkpoint_file, stringsAsFactors = FALSE)
+    combined <- rbind(existing, checkpoint_row)
+    combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
+    write.csv(combined, checkpoint_file, row.names = FALSE)
+  } else {
+    write.csv(checkpoint_row, checkpoint_file, row.names = FALSE)
+  }
+}
+
+read_cached_replicate_diagnostics <- function(method_progress_dir) {
+  if (is.null(method_progress_dir) || !dir.exists(method_progress_dir)) {
+    return(NULL)
+  }
+  files <- list.files(method_progress_dir, pattern = "^replicate_\\d+\\.csv$", full.names = TRUE)
+  if (length(files) == 0) {
+    return(NULL)
+  }
+  do.call(rbind, lapply(files, read.csv, stringsAsFactors = FALSE))
+}
+
 normalize_missing_metadata <- function(datasets, metadata, file_path = NULL) {
   n_datasets <- length(datasets)
   if (nrow(metadata) == n_datasets) {
@@ -35,184 +84,8 @@ normalize_missing_metadata <- function(datasets, metadata, file_path = NULL) {
   ))
 }
 
-run_all_models_for_dataset <- function(
-  datasets,
-  metadata,
-  procedure_name,
-  model_spec,
-  covariate_registry,
-  procedure_registry,
-  model_registry,
-  n_reps = REPLICATES_DEFAULT,
-  bootstrap_reps = BOOTSTRAP_REPS_DEFAULT,
-  bootstrap_seed = BOOTSTRAP_SEED_DEFAULT,
-  cf_folds = CF_FOLDS,
-  true_effect = TRUE_EFFECT_DEFAULT,
-  null_effect = NULL_EFFECT_DEFAULT,
-  ci_level = CI_LEVEL_DEFAULT,
-  use_parallel = TRUE,
-  cores = NULL
-) {
-  if (length(datasets) == 0) {
-    stop("No datasets supplied.")
-  }
-  metadata <- normalize_missing_metadata(datasets, metadata)
-
-  if (!is.null(n_reps)) {
-    if (!is.numeric(n_reps) || length(n_reps) != 1 || is.na(n_reps) || n_reps < 1) {
-      stop("n_reps must be a single positive number.")
-    }
-    n_keep <- min(length(datasets), as.integer(n_reps))
-    datasets <- datasets[seq_len(n_keep)]
-    metadata <- metadata[seq_len(n_keep), , drop = FALSE]
-  }
-
-  procedure <- procedure_registry[[procedure_name]]
-  if (is.null(procedure)) {
-    stop(paste("Unknown procedure:", procedure_name))
-  }
-
-  if (is.null(cores)) {
-    cores <- parallel::detectCores(logical = TRUE)
-  }
-
-  if (use_parallel) {
-    doParallel::registerDoParallel(max(1, cores - 1))
-    `%op%` <- foreach::`%dopar%`
-  } else {
-    foreach::registerDoSEQ()
-    `%op%` <- foreach::`%do%`
-  }
-
-  model_names <- names(model_registry)
-  cat(
-    "Starting",
-    procedure$name,
-    "for model spec",
-    model_spec,
-    "with estimators:",
-    paste(model_names, collapse = ", "),
-    "\n"
-  )
-
-  z_crit <- stats::qnorm((1 + ci_level) / 2)
-
-  results <- foreach::foreach(
-    i = seq_along(datasets),
-    .combine = rbind,
-    .packages = c("parsnip", "ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr", "rsample", "dplyr")
-  ) %op% {
-    df <- as.data.frame(datasets[[i]])
-    df[] <- lapply(df, function(x) if (is.factor(x)) as.numeric(as.character(x)) else x)
-
-    per_model <- lapply(model_names, function(model_name) {
-      cat(
-        "Running estimator",
-        model_name,
-        "for procedure",
-        procedure$name,
-        "and model spec",
-        model_spec,
-        "on scenario",
-        i,
-        "of",
-        length(datasets),
-        "\n"
-      )
-
-      model <- model_registry[[model_name]]
-      covariates <- resolve_covariates(model_spec, covariate_registry, df)
-      if (model_name == "correct_model") {
-        covariates <- resolve_covariates("correct", covariate_registry, df)
-      }
-
-      rep_time_start <- Sys.time()
-      res <- procedure$run(
-        df = df,
-        outcome = "y",
-        covariates = covariates,
-        model = model,
-        folds = cf_folds
-      )
-
-      estimate_from_df <- function(dat) {
-        out <- procedure$run(
-          df = dat,
-          outcome = "y",
-          covariates = covariates,
-          model = model,
-          folds = cf_folds
-        )
-        as.numeric(out$estimate)
-      }
-
-      bootstrap_se <- NA_real_
-      bootstrap_bias <- NA_real_
-      bc_estimate <- NA_real_
-      bc_ci_lower <- NA_real_
-      bc_ci_upper <- NA_real_
-      bootstrap_time_sec <- NA_real_
-      se_used <- NA_real_
-
-      if (isTRUE(procedure$use_eif_var)) {
-        se_used <- res$eif_se
-      } else {
-        boot_start <- Sys.time()
-        set.seed(bootstrap_seed + i)
-        boot_estimates <- vapply(seq_len(bootstrap_reps), function(b) {
-          idx <- sample.int(nrow(df), size = nrow(df), replace = TRUE)
-          df_boot <- df[idx, , drop = FALSE]
-          estimate_from_df(df_boot)
-        }, numeric(1))
-        bootstrap_time_sec <- as.numeric(difftime(Sys.time(), boot_start, units = "secs"))
-        bootstrap_se <- stats::sd(boot_estimates)
-        bootstrap_bias <- mean(boot_estimates) - res$estimate
-        bc_estimate <- res$estimate - bootstrap_bias
-        bc_ci_lower <- bc_estimate - z_crit * bootstrap_se
-        bc_ci_upper <- bc_estimate + z_crit * bootstrap_se
-        se_used <- bootstrap_se
-      }
-
-      ci_lower <- res$estimate - z_crit * se_used
-      ci_upper <- res$estimate + z_crit * se_used
-
-      covered_true_95 <- as.integer(ci_lower <= true_effect && true_effect <= ci_upper)
-      covered_true_95_bc <- as.integer(bc_ci_lower <= true_effect && true_effect <= bc_ci_upper)
-      reject_h0_effect <- as.integer(ci_lower > true_effect || ci_upper < true_effect)
-      reject_h0_null <- as.integer(ci_lower > null_effect || ci_upper < null_effect)
-
-      rep_time_sec <- as.numeric(difftime(Sys.time(), rep_time_start, units = "secs"))
-
-      data.frame(
-        replicate = i,
-        Estimator = model$name,
-        Procedure = procedure$name,
-        ModelSpec = model_spec,
-        n_obs = res$n_obs,
-        estimate = res$estimate,
-        bias = res$bias,
-        eif_var = res$eif_var,
-        eif_se = res$eif_se,
-        bootstrap_se = bootstrap_se,
-        bootstrap_bias = bootstrap_bias,
-        bc_estimate = bc_estimate,
-        ci_lower = ci_lower,
-        ci_upper = ci_upper,
-        bc_ci_lower = bc_ci_lower,
-        bc_ci_upper = bc_ci_upper,
-        covered_true_95 = covered_true_95,
-        covered_true_95_bc = covered_true_95_bc,
-        reject_h0_effect = reject_h0_effect,
-        reject_h0_null = reject_h0_null,
-        bootstrap_time_sec = bootstrap_time_sec,
-        replicate_time_sec = rep_time_sec,
-        stringsAsFactors = FALSE
-      )
-    })
-
-    do.call(rbind, per_model)
-  }
-
+summarize_missing_replicates <- function(results, metadata) {
+  # Aggregate replicate-level diagnostics into a single method summary.
   results <- as.data.frame(results)
   if (nrow(results) == 0) {
     stop("No results were produced; check model registry configuration.")
@@ -276,6 +149,14 @@ run_all_models_for_dataset <- function(
   merged <- do.call(rbind, summaries)
   merged$std_bias <- ifelse(merged$mc_sd_estimate > 0, merged$mean_bias / merged$mc_sd_estimate, NA)
 
+  # Relative efficiency uses the Monte Carlo variance relative to lm.
+  lm_var <- merged$mc_var_estimate[merged$Estimator == "lm"]
+  merged$relative_efficiency <- ifelse(
+    merged$mc_var_estimate > 0 & length(lm_var) == 1 && !is.na(lm_var),
+    lm_var / merged$mc_var_estimate,
+    NA_real_
+  )
+
   meta <- data.frame(
     n = metadata$n[1],
     target_r2 = metadata$target_r2[1],
@@ -286,8 +167,235 @@ run_all_models_for_dataset <- function(
   )
 
   output <- cbind(meta, merged)
-  attr(output, "replicate_diagnostics") <- results
-  output
+  list(summary = output, diagnostics = results)
+}
+
+run_all_models_for_dataset <- function(
+  datasets,
+  metadata,
+  procedure_name,
+  model_spec,
+  covariate_registry,
+  procedure_registry,
+  model_registry,
+  n_reps = REPLICATES_DEFAULT,
+  bootstrap_reps = BOOTSTRAP_REPS_DEFAULT,
+  bootstrap_seed = BOOTSTRAP_SEED_DEFAULT,
+  cf_folds = CF_FOLDS,
+  true_effect = TRUE_EFFECT_DEFAULT,
+  null_effect = NULL_EFFECT_DEFAULT,
+  ci_level = CI_LEVEL_DEFAULT,
+  use_parallel = TRUE,
+  cores = NULL,
+  replicate_ids = NULL,
+  progress_dir = NULL,
+  log_file = NULL
+) {
+  if (length(datasets) == 0) {
+    stop("No datasets supplied.")
+  }
+  metadata <- normalize_missing_metadata(datasets, metadata)
+
+  # Support resuming on a subset of replicates when checkpoints exist.
+  if (!is.null(replicate_ids)) {
+    if (!is.numeric(replicate_ids) || any(is.na(replicate_ids))) {
+      stop("replicate_ids must be a numeric vector of replicate indices.")
+    }
+    if (any(replicate_ids < 1) || any(replicate_ids > length(datasets))) {
+      stop("replicate_ids contain indices outside the available dataset range.")
+    }
+    datasets <- datasets[replicate_ids]
+    metadata <- metadata[replicate_ids, , drop = FALSE]
+  } else if (!is.null(n_reps)) {
+    if (!is.numeric(n_reps) || length(n_reps) != 1 || is.na(n_reps) || n_reps < 1) {
+      stop("n_reps must be a single positive number.")
+    }
+    n_keep <- min(length(datasets), as.integer(n_reps))
+    datasets <- datasets[seq_len(n_keep)]
+    metadata <- metadata[seq_len(n_keep), , drop = FALSE]
+    replicate_ids <- seq_len(n_keep)
+  } else {
+    replicate_ids <- seq_len(length(datasets))
+  }
+
+  procedure <- procedure_registry[[procedure_name]]
+  if (is.null(procedure)) {
+    stop(paste("Unknown procedure:", procedure_name))
+  }
+
+  if (is.null(cores)) {
+    cores <- parallel::detectCores(logical = TRUE)
+  }
+
+  if (use_parallel) {
+    doParallel::registerDoParallel(max(1, cores - 1))
+    `%op%` <- foreach::`%dopar%`
+  } else {
+    foreach::registerDoSEQ()
+    `%op%` <- foreach::`%do%`
+  }
+
+  model_names <- names(model_registry)
+  cat(
+    "Starting",
+    procedure$name,
+    "for model spec",
+    model_spec,
+    "with estimators:",
+    paste(model_names, collapse = ", "),
+    "\n"
+  )
+
+  z_crit <- stats::qnorm((1 + ci_level) / 2)
+
+  results <- foreach::foreach(
+    i = seq_along(datasets),
+    .combine = rbind,
+    .packages = c("parsnip", "ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr", "rsample", "dplyr")
+  ) %op% {
+    df <- as.data.frame(datasets[[i]])
+    df[] <- lapply(df, function(x) if (is.factor(x)) as.numeric(as.character(x)) else x)
+
+    rep_id <- replicate_ids[i]
+    per_model <- lapply(model_names, function(model_name) {
+      log_line <- sprintf(
+        "Running estimator %s for procedure %s and model spec %s on scenario %s of %s",
+        model_name,
+        procedure$name,
+        model_spec,
+        rep_id,
+        length(datasets)
+      )
+      if (!use_parallel) {
+        cat(log_line, "\n")
+      } else {
+        log_progress_line(log_file, log_line)
+      }
+
+      method_progress_dir <- NULL
+      if (!is.null(progress_dir) && nzchar(progress_dir)) {
+        method_progress_dir <- file.path(progress_dir, procedure$name, model_spec, model_name)
+      }
+
+      model <- model_registry[[model_name]]
+      covariates <- resolve_covariates(model_spec, covariate_registry, df)
+      if (model_name == "correct_model") {
+        covariates <- resolve_covariates("correct", covariate_registry, df)
+      }
+
+      # Capture per-replicate timing for sequential runs.
+      rep_time_start <- Sys.time()
+      res <- procedure$run(
+        df = df,
+        outcome = "y",
+        covariates = covariates,
+        model = model,
+        folds = cf_folds
+      )
+
+      estimate_from_df <- function(dat) {
+        out <- procedure$run(
+          df = dat,
+          outcome = "y",
+          covariates = covariates,
+          model = model,
+          folds = cf_folds
+        )
+        as.numeric(out$estimate)
+      }
+
+      bootstrap_se <- NA_real_
+      bootstrap_bias <- NA_real_
+      bc_estimate <- NA_real_
+      bc_ci_lower <- NA_real_
+      bc_ci_upper <- NA_real_
+      bootstrap_time_sec <- NA_real_
+      se_used <- NA_real_
+
+      if (isTRUE(procedure$use_eif_var)) {
+        se_used <- res$eif_se
+      } else {
+        boot_start <- Sys.time()
+        set.seed(bootstrap_seed + rep_id)
+        boot_estimates <- vapply(seq_len(bootstrap_reps), function(b) {
+          idx <- sample.int(nrow(df), size = nrow(df), replace = TRUE)
+          df_boot <- df[idx, , drop = FALSE]
+          estimate_from_df(df_boot)
+        }, numeric(1))
+        bootstrap_time_sec <- as.numeric(difftime(Sys.time(), boot_start, units = "secs"))
+        bootstrap_se <- stats::sd(boot_estimates)
+        bootstrap_bias <- mean(boot_estimates) - res$estimate
+        bc_estimate <- res$estimate - bootstrap_bias
+        bc_ci_lower <- bc_estimate - z_crit * bootstrap_se
+        bc_ci_upper <- bc_estimate + z_crit * bootstrap_se
+        se_used <- bootstrap_se
+      }
+
+      ci_lower <- res$estimate - z_crit * se_used
+      ci_upper <- res$estimate + z_crit * se_used
+
+      covered_true_95 <- as.integer(ci_lower <= true_effect && true_effect <= ci_upper)
+      covered_true_95_bc <- as.integer(bc_ci_lower <= true_effect && true_effect <= bc_ci_upper)
+      reject_h0_effect <- as.integer(ci_lower > true_effect || ci_upper < true_effect)
+      reject_h0_null <- as.integer(ci_lower > null_effect || ci_upper < null_effect)
+
+      rep_time_sec <- as.numeric(difftime(Sys.time(), rep_time_start, units = "secs"))
+      rep_row <- data.frame(
+        replicate = rep_id,
+        Estimator = model$name,
+        Procedure = procedure$name,
+        ModelSpec = model_spec,
+        n_obs = res$n_obs,
+        estimate = res$estimate,
+        bias = res$bias,
+        eif_var = res$eif_var,
+        eif_se = res$eif_se,
+        bootstrap_se = bootstrap_se,
+        bootstrap_bias = bootstrap_bias,
+        bc_estimate = bc_estimate,
+        ci_lower = ci_lower,
+        ci_upper = ci_upper,
+        bc_ci_lower = bc_ci_lower,
+        bc_ci_upper = bc_ci_upper,
+        covered_true_95 = covered_true_95,
+        covered_true_95_bc = covered_true_95_bc,
+        reject_h0_effect = reject_h0_effect,
+        reject_h0_null = reject_h0_null,
+        bootstrap_time_sec = bootstrap_time_sec,
+        replicate_time_sec = rep_time_sec,
+        stringsAsFactors = FALSE
+      )
+
+      write_replicate_cache(method_progress_dir, rep_row)
+
+      if (!use_parallel) {
+        cat(
+          "Running estimator",
+          model_name,
+          "replicate",
+          rep_id,
+          "completed in",
+          round(rep_time_sec, 3),
+          "sec\n"
+        )
+      } else {
+        log_progress_line(log_file, sprintf(
+          "Running estimator %s replicate %s completed in %s sec",
+          model_name,
+          rep_id,
+          round(rep_time_sec, 3)
+        ))
+      }
+
+      rep_row
+    })
+
+    do.call(rbind, per_model)
+  }
+
+  summary_res <- summarize_missing_replicates(results, metadata)
+  attr(summary_res$summary, "replicate_diagnostics") <- summary_res$diagnostics
+  summary_res$summary
 }
 
 run_all_methods_for_dataset <- function(
@@ -395,6 +503,52 @@ ensure_dir <- function(path) {
   }
 }
 
+merge_replicate_checkpoint <- function(existing, incoming) {
+  # Keep the latest status row per replicate when resuming.
+  if (is.null(existing) || nrow(existing) == 0) {
+    return(incoming)
+  }
+  combined <- rbind(existing, incoming)
+  combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
+  combined
+}
+
+merge_replicate_diagnostics <- function(existing, incoming) {
+  # De-duplicate by replicate, preferring the most recent diagnostics.
+  if (is.null(existing) || nrow(existing) == 0) {
+    return(incoming)
+  }
+  combined <- rbind(existing, incoming)
+  combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
+  combined
+}
+
+recompute_missing_relative_efficiency <- function(results) {
+  # Recompute relative efficiency from Monte Carlo variance when aggregating per-scenario results.
+  if (!is.data.frame(results) || nrow(results) == 0) {
+    return(results)
+  }
+  if (!"relative_efficiency" %in% names(results)) {
+    results$relative_efficiency <- NA_real_
+  }
+  var_col <- if ("mc_var_estimate" %in% names(results)) {
+    "mc_var_estimate"
+  } else if ("var_estimate" %in% names(results)) {
+    "var_estimate"
+  } else {
+    return(results)
+  }
+  lm_var <- results[results$Estimator == "lm", var_col]
+  if (length(lm_var) == 1 && !is.na(lm_var)) {
+    results$relative_efficiency <- ifelse(
+      results[[var_col]] > 0,
+      lm_var / results[[var_col]],
+      NA_real_
+    )
+  }
+  results
+}
+
 resolve_missing_input_root <- function() {
   data_source <- tolower(Sys.getenv("DATA_SOURCE", "local"))
   archive_dir <- Sys.getenv("ARCHIVE_DATASETS_DIR", "")
@@ -442,6 +596,7 @@ run_procedure_for_setting <- function(
   log_dir <- file.path("logs", "missing_outcomes", setting_name, procedure_name)
   ensure_dir(log_dir)
   log_path <- file.path(log_dir, sprintf("%s_%s.log", procedure_name, format(Sys.time(), "%Y%m%d_%H%M%S")))
+  log_path <- normalizePath(log_path, mustWork = FALSE)
   sink(log_path, append = TRUE, split = TRUE)
   on.exit(sink(), add = TRUE)
 
@@ -488,6 +643,7 @@ run_procedure_for_setting <- function(
       scenario_name <- tools::file_path_sans_ext(basename(file_path))
       scenario_dir <- file.path(model_dir, scenario_name)
       ensure_dir(scenario_dir)
+      scenario_progress_dir <- normalizePath(file.path(scenario_dir, "replicate_cache"), mustWork = FALSE)
 
       cat("Processing scenario:", basename(file_path), "\n")
       env <- new.env(parent = emptyenv())
@@ -517,6 +673,46 @@ run_procedure_for_setting <- function(
           next
         }
 
+        method_rep_checkpoint <- file.path(scenario_dir, paste0(method_name, "_replicate_checkpoint.csv"))
+        method_diag_file <- file.path(scenario_dir, paste0(method_name, "_replicate_diagnostics.csv"))
+        method_file <- file.path(scenario_dir, paste0(method_name, "_results.csv"))
+
+        method_progress_dir <- file.path(scenario_progress_dir, procedure_name, model_spec, method_name)
+        cached_diag <- read_cached_replicate_diagnostics(method_progress_dir)
+        if (!is.null(cached_diag)) {
+          diag_existing <- NULL
+          if (file.exists(method_diag_file)) {
+            diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
+          }
+          diag_all_cached <- merge_replicate_diagnostics(diag_existing, cached_diag)
+          write.csv(diag_all_cached, method_diag_file, row.names = FALSE)
+        }
+
+        completed_reps <- integer(0)
+        rep_checkpoint <- NULL
+        if (file.exists(method_rep_checkpoint)) {
+          rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
+          completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
+        }
+        if (!is.null(cached_diag) && "replicate" %in% names(cached_diag)) {
+          completed_reps <- unique(c(completed_reps, cached_diag$replicate))
+        }
+        replicate_ids <- seq_len(reps_to_run)
+        pending_reps <- setdiff(replicate_ids, completed_reps)
+        if (length(pending_reps) == 0) {
+          method_cp <- rbind(
+            method_cp,
+            data.frame(method = method_name, status = "done", timestamp = as.character(Sys.time()), error = "", stringsAsFactors = FALSE)
+          )
+          write.csv(method_cp, method_checkpoint, row.names = FALSE)
+          method_cache_dir <- file.path(scenario_progress_dir, procedure_name, model_spec, method_name)
+          if (dir.exists(method_cache_dir)) {
+            unlink(method_cache_dir, recursive = TRUE, force = TRUE)
+          }
+          cat("Skipping completed method:", method_name, "for", scenario_name, "\n")
+          next
+        }
+
         cat("Running method:", method_name, "for", scenario_name, "\n")
         method_start <- Sys.time()
         msg <- ""
@@ -524,8 +720,8 @@ run_procedure_for_setting <- function(
 
         tryCatch({
           results <- run_all_models_for_dataset(
-            datasets = datasets,
-            metadata = metadata,
+            datasets = datasets[pending_reps],
+            metadata = metadata[pending_reps, , drop = FALSE],
             procedure_name = procedure_name,
             model_spec = model_spec,
             covariate_registry = covariate_registry,
@@ -539,17 +735,34 @@ run_procedure_for_setting <- function(
             null_effect = null_effect,
             ci_level = ci_level,
             use_parallel = use_parallel,
-            cores = cores
+            cores = cores,
+            replicate_ids = pending_reps,
+            progress_dir = scenario_progress_dir,
+            log_file = log_path
           )
 
-          method_file <- file.path(scenario_dir, paste0(method_name, "_results.csv"))
-          write.csv(results, file = method_file, row.names = FALSE)
-
-          diag <- attr(results, "replicate_diagnostics")
-          if (!is.null(diag) && nrow(diag) > 0) {
-            diag_file <- file.path(scenario_dir, paste0(method_name, "_replicate_diagnostics.csv"))
-            write.csv(diag, diag_file, row.names = FALSE)
+          diag_new <- attr(results, "replicate_diagnostics")
+          diag_existing <- NULL
+          if (file.exists(method_diag_file)) {
+            diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
           }
+          diag_all <- merge_replicate_diagnostics(diag_existing, diag_new)
+          summary_res <- summarize_missing_replicates(diag_all, metadata)
+          diag_all <- summary_res$diagnostics
+          # Persist diagnostics before marking checkpoints so resume has data to aggregate.
+          write.csv(summary_res$summary, file = method_file, row.names = FALSE)
+          write.csv(diag_all, method_diag_file, row.names = FALSE)
+
+          rep_rows <- data.frame(
+            replicate = pending_reps,
+            status = "done",
+            timestamp = as.character(Sys.time()),
+            error = "",
+            stringsAsFactors = FALSE
+          )
+          rep_checkpoint <- merge_replicate_checkpoint(rep_checkpoint, rep_rows)
+          # Replicate checkpoint advances only after diagnostics + summary are saved.
+          write.csv(rep_checkpoint, method_rep_checkpoint, row.names = FALSE)
         }, error = function(e) {
           status <<- "error"
           msg <<- conditionMessage(e)
@@ -558,12 +771,23 @@ run_procedure_for_setting <- function(
         method_elapsed <- as.numeric(difftime(Sys.time(), method_start, units = "secs"))
         cat("Running method:", method_name, "completed in", round(method_elapsed, 2), "sec\n")
 
-        method_cp <- rbind(method_cp, data.frame(method = method_name, status = status, timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE))
-        write.csv(method_cp, method_checkpoint, row.names = FALSE)
-        cat("Method checkpointed:", method_name, "for", scenario_name, "\n")
-
         if (status == "error") {
+          method_cp <- rbind(method_cp, data.frame(method = method_name, status = status, timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE))
+          write.csv(method_cp, method_checkpoint, row.names = FALSE)
+          cat("Method checkpointed:", method_name, "for", scenario_name, "\n")
           stop(msg)
+        }
+
+        rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
+        completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
+        if (length(completed_reps) == length(replicate_ids)) {
+          method_cp <- rbind(method_cp, data.frame(method = method_name, status = "done", timestamp = as.character(Sys.time()), error = msg, stringsAsFactors = FALSE))
+          write.csv(method_cp, method_checkpoint, row.names = FALSE)
+          method_cache_dir <- file.path(scenario_progress_dir, procedure_name, model_spec, method_name)
+          if (dir.exists(method_cache_dir)) {
+            unlink(method_cache_dir, recursive = TRUE, force = TRUE)
+          }
+          cat("Method checkpointed:", method_name, "for", scenario_name, "\n")
         }
       }
 
@@ -571,29 +795,11 @@ run_procedure_for_setting <- function(
       scenario_file <- file.path(scenario_dir, paste0(scenario_name, "_results.csv"))
       if (length(method_files) > 0) {
         scenario_agg <- do.call(rbind, lapply(method_files, read.csv, stringsAsFactors = FALSE))
-        if ("relative_efficiency" %in% names(scenario_agg)) {
-          lm_var <- scenario_agg$mc_var_estimate[scenario_agg$Estimator == "lm"]
-          if (length(lm_var) == 1 && !is.na(lm_var)) {
-            scenario_agg$relative_efficiency <- ifelse(
-              scenario_agg$mc_var_estimate > 0,
-              lm_var / scenario_agg$mc_var_estimate,
-              NA_real_
-            )
-          }
-        }
+        scenario_agg <- recompute_missing_relative_efficiency(scenario_agg)
         write.csv(scenario_agg, file = scenario_file, row.names = FALSE)
       } else if (file.exists(scenario_file)) {
         scenario_agg <- read.csv(scenario_file, stringsAsFactors = FALSE)
-        if ("relative_efficiency" %in% names(scenario_agg)) {
-          lm_var <- scenario_agg$mc_var_estimate[scenario_agg$Estimator == "lm"]
-          if (length(lm_var) == 1 && !is.na(lm_var)) {
-            scenario_agg$relative_efficiency <- ifelse(
-              scenario_agg$mc_var_estimate > 0,
-              lm_var / scenario_agg$mc_var_estimate,
-              NA_real_
-            )
-          }
-        }
+        scenario_agg <- recompute_missing_relative_efficiency(scenario_agg)
         write.csv(scenario_agg, file = scenario_file, row.names = FALSE)
       }
 
