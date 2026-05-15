@@ -2,6 +2,36 @@
 
 source(file.path("simulations", "missing_outcomes", "miss_scripts", "miss_registry.R"))
 
+required_packages <- c(
+  "parsnip",
+  "ranger",
+  "dbarts",
+  "SuperLearner",
+  "xgboost",
+  "magrittr",
+  "purrr",
+  "rsample",
+  "dplyr",
+  "foreach",
+  "doParallel",
+  "nnls",
+  "gam"
+) # Required packages for missing-outcome workflows (models, CF helpers, and parallel orchestration).
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  renv_lock <- file.path(getwd(), "renv.lock")
+  if (requireNamespace("renv", quietly = TRUE) && file.exists(renv_lock)) {
+    renv::install(missing_packages, prompt = FALSE)
+  } else {
+    install.packages(missing_packages, repos = "https://cloud.r-project.org")
+  }
+}
+
+invisible(lapply(required_packages, function(pkg) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}))
+
 # Global defaults (override via environment variables as needed).
 CF_FOLDS <- as.integer(Sys.getenv("CF_FOLDS", CF_FOLDS))
 BOOTSTRAP_REPS_DEFAULT <- as.integer(Sys.getenv("BOOTSTRAP_REPS", 250))
