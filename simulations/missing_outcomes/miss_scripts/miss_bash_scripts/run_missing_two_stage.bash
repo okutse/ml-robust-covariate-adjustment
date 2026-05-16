@@ -19,7 +19,7 @@ project_root="$(cd "$script_dir/../../../.." && pwd)"
 cd "$project_root"
 
 # Activate renv first, then restore the project library before any analysis code runs.
-Rscript -e 'source("renv/activate.R"); renv::restore(prompt = FALSE)'
+Rscript -e 'source("ml-robust-covariate-adjustment/renv/activate.R"); renv::restore(prompt = FALSE)'
 
 # Example:
 # sbatch simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_two_stage.bash
