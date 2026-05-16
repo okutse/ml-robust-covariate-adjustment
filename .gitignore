@@ -95,3 +95,7 @@ simulations/missing_outcomes/miss_scripts/reconcile_missing_outputs.R
 .positai
 
 .DS_Store
+
+
+# ignore archive files
+simulations/missing_outcomes/archives/

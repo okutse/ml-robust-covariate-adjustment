@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=miss_single_stage
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:0
+#SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
@@ -9,6 +8,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/missing_outcomes/single_stage_%A.out
 #SBATCH --error=logs/missing_outcomes/single_stage_%A.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=amos_okutse@brown.edu
 
 set -euo pipefail
 module load r/4.5.1
