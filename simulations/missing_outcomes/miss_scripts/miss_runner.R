@@ -45,21 +45,61 @@ required_packages <- c(
   "jsonlite"
 ) # Required packages for missing-outcome workflows (models, CF helpers, and parallel orchestration).
 
-assert_renv_active()
+install_missing_required_packages <- function(required_packages) {
+  cat("[env-check] Validating required packages before processing...\n")
 
-missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing_packages) > 0) {
-  stop(
-    "Missing required packages before processing begins: ",
+  renv_active <- FALSE
+  if (requireNamespace("renv", quietly = TRUE)) {
+    renv_active <- isTRUE(tryCatch({
+      assert_renv_active()
+      TRUE
+    }, error = function(e) {
+      FALSE
+    }))
+  }
+
+  missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing_packages) == 0) {
+    cat("[env-check] All required packages are available.\n")
+    return(invisible(NULL))
+  }
+
+  cat(
+    "[env-check] Missing required packages detected: ",
     paste(missing_packages, collapse = ", "),
-    ". Run `Rscript -e \"renv::restore()\"` from the repository root before submitting the batch job."
+    "\n",
+    sep = ""
   )
+  cat("[env-check] Installing only required packages for this submitted job and their dependencies...\n")
+
+  if (renv_active) {
+    renv::install(missing_packages, prompt = FALSE)
+  } else {
+    install.packages(missing_packages, repos = "https://cloud.r-project.org", dependencies = TRUE)
+  }
+
+  unresolved <- missing_packages[!vapply(missing_packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(unresolved) > 0) {
+    stop(
+      "[env-check] Package bootstrap completed with failures. Unresolved packages: ",
+      paste(unresolved, collapse = ", "),
+      "."
+    )
+  }
+
+  cat("[env-check] Required packages have been loaded successfully. Proceeding with processing.\n")
 }
+
+install_missing_required_packages(required_packages)
 
 invisible(lapply(required_packages, function(pkg) {
   suppressPackageStartupMessages(library(pkg, character.only = TRUE))
 }))
 
+
+
+
+##-- DATA LOADING AND HELPERS --##
 
 # source the main shared helper for resolving path and loading datasets
 source(file.path("helpers", "data_source_helpers.R"))
