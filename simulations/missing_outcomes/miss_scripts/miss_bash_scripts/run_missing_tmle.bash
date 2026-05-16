@@ -13,13 +13,12 @@
 set -euo pipefail
 module load r/4.5.1
 
-# Run the job from the repository root so renv and project-relative paths resolve correctly.
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-project_root="$(cd "$script_dir/../../../.." && pwd)"
+# Run the job from the Slurm submission directory so renv and project-relative paths resolve correctly.
+project_root="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$project_root"
 
 # Activate renv first, then restore the project library before any analysis code runs.
-Rscript -e 'source("ml-robust-covariate-adjustment/renv/activate.R"); renv::restore(prompt = FALSE)'
+Rscript -e 'source("renv/activate.R"); renv::restore(prompt = FALSE)'
 
 # Example:
 # sbatch simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_tmle.bash

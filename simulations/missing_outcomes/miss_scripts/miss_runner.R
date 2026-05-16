@@ -2,6 +2,32 @@
 
 source(file.path("simulations", "missing_outcomes", "miss_scripts", "miss_registry.R"))
 
+assert_renv_active <- function() {
+  if (!requireNamespace("renv", quietly = TRUE)) {
+    stop("renv is not available in the current R session. Restore the project library before running this analysis.")
+  }
+
+  project_root <- tryCatch(renv::project(), error = function(e) "")
+  if (!nzchar(project_root)) {
+    stop("renv is not active for this session. Run the job from the repository root after restoring renv.")
+  }
+
+  project_library <- tryCatch(renv::paths$library(project_root), error = function(e) "")
+  if (!nzchar(project_library)) {
+    stop("Unable to resolve the renv project library for this session.")
+  }
+
+  active_libraries <- normalizePath(.libPaths(), winslash = "/", mustWork = FALSE)
+  project_library <- normalizePath(project_library, winslash = "/", mustWork = FALSE)
+  if (!project_library %in% active_libraries) {
+    stop(
+      "renv is not active for this session. The project library is not on .libPaths(). ",
+      "Activate renv before running the analysis.")
+  }
+
+  invisible(TRUE)
+}
+
 required_packages <- c(
   "parsnip",
   "ranger",
@@ -19,19 +45,15 @@ required_packages <- c(
   "jsonlite"
 ) # Required packages for missing-outcome workflows (models, CF helpers, and parallel orchestration).
 
+assert_renv_active()
+
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
-  renv_lock <- file.path(getwd(), "renv.lock")
-  allow_runtime_install <- tolower(Sys.getenv("ALLOW_RUNTIME_PACKAGE_INSTALL", "false")) == "true"
-  if (allow_runtime_install && requireNamespace("renv", quietly = TRUE) && file.exists(renv_lock)) {
-    renv::install(missing_packages, prompt = FALSE)
-  } else {
-    stop(
-      "Missing required packages before processing begins: ",
-      paste(missing_packages, collapse = ", "),
-      ". Run `Rscript -e \"renv::restore()\"` from the repository root before submitting the batch job."
-    )
-  }
+  stop(
+    "Missing required packages before processing begins: ",
+    paste(missing_packages, collapse = ", "),
+    ". Run `Rscript -e \"renv::restore()\"` from the repository root before submitting the batch job."
+  )
 }
 
 invisible(lapply(required_packages, function(pkg) {
