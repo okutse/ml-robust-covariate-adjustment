@@ -33,32 +33,6 @@ if (file.exists(renv_activate)) {
   source(renv_activate)
 }
 
-# Fail fast in batch jobs if the project library is not ready before any analysis starts.
-required_packages <- c(
-  "parsnip",
-  "ranger",
-  "dbarts",
-  "SuperLearner",
-  "xgboost",
-  "magrittr",
-  "purrr",
-  "rsample",
-  "dplyr",
-  "foreach",
-  "doParallel",
-  "nnls",
-  "gam",
-  "jsonlite"
-)
-missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing_packages) > 0) {
-  stop(
-    "Missing required packages before processing begins: ",
-    paste(missing_packages, collapse = ", "),
-    ". Run `Rscript -e \"renv::restore()\"` from the repository root and resubmit the job."
-  )
-}
-
 source(file.path(project_root, "simulations", "missing_outcomes", "miss_scripts", "miss_runner.R"))
 
 setting_name <- Sys.getenv("SETTING", "setting_three") # can be changed via environment variable, e.g. when running on Slurm or locally with different settings
