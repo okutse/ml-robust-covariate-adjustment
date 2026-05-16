@@ -102,7 +102,7 @@ format_r2 <- function(r2) {
 
 # Generate datasets across n and R^2 values.
 reps <- 1000
-sample_sizes <- c(200, 500, 1000, 2000, 10000)
+sample_sizes <- c(200, 500, 1000, 2000, 5000)
 target_r2s <- c(0.20, 0.40, 0.60, 0.80) # achieved by varying the noise level
 base_seed <- 12345
 settings <- list(

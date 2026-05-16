@@ -100,7 +100,7 @@ format_r2 <- function(r2) {
 
 # Generate datasets across n and R^2 values and missing outcome settings for downstream analysis
 reps <- 1000
-sample_sizes <- c(200, 500, 1000, 2000, 10000)
+sample_sizes <- c(200, 500, 1000, 2000, 5000)
 target_r2s <- c(0.20, 0.40, 0.60, 0.80) # these are achieved by varying the noise level (\sigma_Z) in the data generating process
 base_seed <- 12345
 settings <- list(

@@ -35,7 +35,9 @@ write_replicate_cache <- function(method_dir, rep_row) {
   cache_file <- file.path(method_dir, sprintf("replicate_%s.csv", rep_row$replicate))
   write.csv(rep_row, cache_file, row.names = FALSE)
 
-  checkpoint_file <- file.path(method_dir, "replicate_checkpoint.csv")
+  # Write per-replicate checkpoint atomically to avoid race conditions in parallel execution.
+  # Multiple workers write their own checkpoint files without interfering.
+  checkpoint_file <- file.path(method_dir, sprintf("replicate_%s_checkpoint.csv", rep_row$replicate))
   checkpoint_row <- data.frame(
     replicate = rep_row$replicate,
     status = "done",
@@ -43,14 +45,37 @@ write_replicate_cache <- function(method_dir, rep_row) {
     error = "",
     stringsAsFactors = FALSE
   )
-  if (file.exists(checkpoint_file)) {
-    existing <- read.csv(checkpoint_file, stringsAsFactors = FALSE)
-    combined <- rbind(existing, checkpoint_row)
-    combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
-    write.csv(combined, checkpoint_file, row.names = FALSE)
-  } else {
-    write.csv(checkpoint_row, checkpoint_file, row.names = FALSE)
+  write.csv(checkpoint_row, checkpoint_file, row.names = FALSE)
+  # Update combined checkpoint view for quick resume checks.
+  combined <- consolidate_replicate_checkpoints(method_dir)
+  if (!is.null(combined) && nrow(combined) > 0) {
+    combined_file <- file.path(method_dir, "replicate_checkpoint.csv")
+    write.csv(combined, combined_file, row.names = FALSE)
   }
+}
+
+consolidate_replicate_checkpoints <- function(method_dir) {
+  # Merge per-replicate checkpoint files into a single consolidated checkpoint.
+  # Called at read time to avoid race conditions from concurrent writes.
+  if (is.null(method_dir) || !nzchar(method_dir) || !dir.exists(method_dir)) {
+    return(NULL)
+  }
+  combined_list <- list()
+  combined_file <- file.path(method_dir, "replicate_checkpoint.csv")
+  if (file.exists(combined_file)) {
+    combined_list[[length(combined_list) + 1]] <- read.csv(combined_file, stringsAsFactors = FALSE)
+  }
+  checkpoint_files <- list.files(method_dir, pattern = "^replicate_\\d+_checkpoint\\.csv$", full.names = TRUE)
+  if (length(checkpoint_files) > 0) {
+    combined_list <- c(combined_list, lapply(checkpoint_files, function(f) read.csv(f, stringsAsFactors = FALSE)))
+  }
+  if (length(combined_list) == 0) return(NULL)
+  combined <- do.call(rbind, combined_list)
+  if (nrow(combined) > 0) {
+    combined <- combined[!duplicated(combined$replicate, fromLast = TRUE), , drop = FALSE]
+    rownames(combined) <- NULL
+  }
+  combined
 }
 
 unadj_cf <- function(df = NULL) {

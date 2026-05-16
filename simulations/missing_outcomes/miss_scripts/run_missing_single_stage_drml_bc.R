@@ -13,7 +13,7 @@
 
 source(file.path("simulations", "missing_outcomes", "miss_scripts", "miss_runner.R"))
 
-setting_name <- Sys.getenv("SETTING", "setting1")
+setting_name <- Sys.getenv("SETTING", "setting_three") # can be changed via environment variable, e.g. when running on Slurm or locally with different settings
 model_specs <- c("m1", "m2")
 
 run_procedure_for_setting(
@@ -25,7 +25,14 @@ run_procedure_for_setting(
 )
 
 # Example run:
-# SETTING=setting1 DATA_SOURCE=local RESET_CHECKPOINT=true \
+# Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R
+#
+# Use the Zenodo DOI if the project-local miss_datasets folder is not present:
+# zenodo_data_doi="https://doi.org/10.5281/zenodo.19393092" \
+# Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R
+#
+# Force a local archive folder if you already unpacked Data.zip:
+# SETTING=setting_three DATA_SOURCE=archive ARCHIVE_DATASETS_DIR=simulations/missing_outcomes/miss_datasets RESET_CHECKPOINT=true \
 # Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R
 
 # Slurm one-liner example (adjust partition/resources as needed):
@@ -33,5 +40,5 @@ run_procedure_for_setting(
 #   --ntasks=1 --cpus-per-task=10 --mem=64G --time=48:00:00 \
 #   --output=logs/missing_outcomes/single_stage_drml_bc_%A.out \
 #   --error=logs/missing_outcomes/single_stage_drml_bc_%A.err \
-#   --export=SETTING=setting1,DATA_SOURCE=local,RESET_CHECKPOINT=true \
+#   --export=SETTING=setting_three,DATA_SOURCE=local,RESET_CHECKPOINT=true \
 #   --wrap="module load r/4.5.1 && Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R"

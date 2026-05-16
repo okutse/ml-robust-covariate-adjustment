@@ -1,17 +1,28 @@
-library(data.table)
-library(foreach)
-library(doParallel)
-library(doSNOW)
-library(parallel)
-library(purrr)
-library(magrittr)
-library(parsnip)
-library(dbarts)
-library(rsample)
-library(SuperLearner)
-library(xgboost)
+# 1. Cross-fitted single-stage covariate adjustment
 
+# Required packages for missing-outcome workflows (models, CF helpers, and parallel orchestration).
+required_packages <- c(
+  "parsnip","ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr",
+  "rsample", "dplyr", "foreach", "doParallel", "nnls", "gam", "data.table",
+  "doSNOW", "renv", "parallel", "magrittr", "parsnip", "dbarts", "SuperLearner", "xgboost", "jsonlite"
+) 
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  renv_lock <- file.path(getwd(), "renv.lock")
+  if (requireNamespace("renv", quietly = TRUE) && file.exists(renv_lock)) {
+    renv::install(missing_packages, prompt = FALSE)
+  } else {
+    install.packages(missing_packages, repos = "https://cloud.r-project.org")
+  }
+}
+
+invisible(lapply(required_packages, function(pkg) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}))
+
+# source the helper functions for all methods implemented.
 source("simulations/complete_data/scripts/cf/cf_single_stage_helpers.R")
+source(file.path("helpers", "data_source_helpers.R"))
 
 # Cross-fitted single-stage simulation (one file per scenario)
 procedure_name <- "single_stage_cf"
@@ -31,6 +42,7 @@ load_data <- function(path) {
 
 # Inputs
 input_dir <- "simulations/complete_data/datasets"
+local_datasets_dir <- input_dir
 output_dir <- file.path("simulations/complete_data/complete_data_results", procedure_name)
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -45,6 +57,84 @@ on.exit(sink(), add = TRUE)
 
 scenario_checkpoint <- file.path(output_dir, "scenario_checkpoint.csv")
 manifest_file <- file.path(output_dir, "input_manifest.csv")
+
+# Keep the data-source switches explicit so users can choose local, archive, or regenerate runs.
+data_source <- normalize_data_source(get_runtime_option(c("data_source", "DATA_SOURCE"), "local"), default = "local")
+archive_dir <- get_runtime_option(c("archive_datasets_dir", "ARCHIVE_DATASETS_DIR"), "")
+sync_archive <- normalize_data_source(get_runtime_option(c("sync_archive_to_local", "SYNC_ARCHIVE_TO_LOCAL"), "false"), default = "false") == "true"
+zenodo_url <- get_runtime_option(c("zenodo_data_url", "ZENODO_DATA_URL", "ZENODO_URL"), "")
+zenodo_doi <- get_runtime_option(c("zenodo_data_doi", "ZENODO_DATA_DOI", "ZENODO_DOI"), "")
+
+resolve_zenodo_url <- function(doi, url) {
+  reference <- if (nzchar(url)) url else doi
+  resolve_zenodo_download_url(reference, preferred_file = "Data.zip")
+}
+
+download_and_unzip <- function(url, dest_dir) {
+  if (url == "") {
+    stop("ZENODO data DOI or URL must be set when a local dataset directory is unavailable.")
+  }
+  if (!dir.exists(dest_dir)) {
+    dir.create(dest_dir, recursive = TRUE)
+  }
+  zip_path <- file.path(dest_dir, "zenodo_datasets.zip")
+  if (file.exists(url) && grepl("\\.zip$", url, ignore.case = TRUE)) {
+    safe_unzip_archive(url, dest_dir)
+  } else {
+    download_archive_file(url, zip_path)
+    safe_unzip_archive(zip_path, dest_dir)
+  }
+  dest_dir
+}
+
+find_archive_dir <- function(base_dir) {
+  find_archive_root(
+    base_dir = base_dir,
+    file_pattern = "^complete_n\\d+_r2_\\d+p\\d+\\.RData$",
+    parent_levels = 0
+  )
+}
+
+if (data_source == "regenerate") {
+  input_dir <- local_datasets_dir
+  # Regenerating complete-data scenarios keeps the same seed-controlled generator behavior.
+  source(file.path("simulations", "complete_data", "scripts", "generate_complete_data.R"))
+} else if (data_source %in% c("archive", "local")) {
+  local_available <- local_dataset_available(local_datasets_dir, "^complete_n\\d+_r2_\\d+p\\d+\\.RData$")
+  if (data_source == "local" && local_available) {
+    input_dir <- local_datasets_dir
+  } else {
+    # Prefer an explicitly supplied local archive folder; otherwise fall back to the Zenodo DOI/URL.
+    archive_source <- archive_dir
+    if (archive_source %in% c("local", "local_datasets")) {
+      archive_source <- local_datasets_dir
+    } else if (!nzchar(archive_source)) {
+      archive_source <- resolve_zenodo_url(doi = if (nzchar(zenodo_url)) zenodo_url else zenodo_doi, url = zenodo_url)
+    }
+
+    if (!nzchar(archive_source)) {
+      if (local_available) {
+        input_dir <- local_datasets_dir
+      } else {
+        stop("No local complete-data datasets were found and no Zenodo DOI/URL was provided.")
+      }
+    } else if (dir.exists(archive_source)) {
+      input_dir <- find_archive_dir(archive_source)
+    } else {
+      zenodo_cache <- file.path("simulations", "complete_data", "archives", "zenodo")
+      download_and_unzip(archive_source, zenodo_cache)
+      input_dir <- find_archive_dir(zenodo_cache)
+    }
+  }
+
+  if (sync_archive && input_dir != local_datasets_dir) {
+    cat("Syncing archived datasets into", local_datasets_dir, "\n")
+    copy_matching_files(input_dir, local_datasets_dir, "^complete_n\\d+_r2_\\d+p\\d+\\.RData$")
+    input_dir <- local_datasets_dir
+  }
+} else {
+  stop("DATA_SOURCE must be either 'local', 'archive', or 'regenerate'.")
+}
 
 all_files <- list.files(input_dir, pattern = "^complete_.*\\.RData$", full.names = TRUE)
 if (length(all_files) == 0) {
@@ -197,22 +287,62 @@ run_single_file <- function(file) {
 
     completed_reps <- integer(0)
     rep_checkpoint <- NULL
-    if (file.exists(method_rep_checkpoint)) {
-      rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
+    # Consolidate per-replicate checkpoint files written by parallel workers
+    rep_checkpoint <- consolidate_replicate_checkpoints(file.path(scenario_progress_dir, method_name))
+    if (!is.null(rep_checkpoint)) {
       completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
     }
     if (!is.null(cached_diag) && "replicate" %in% names(cached_diag)) {
-      completed_reps <- unique(c(completed_reps, cached_diag$replicate))
+      cached_reps_unique <- unique(cached_diag$replicate)
+      completed_reps <- unique(c(completed_reps, cached_reps_unique))
     }
     replicate_ids <- seq_len(reps_to_run)
     pending_reps <- setdiff(replicate_ids, completed_reps)
     if (length(pending_reps) == 0) {
+      # All replicates reported done. Ensure method-level aggregates exist; if not,
+      # attempt to reconstruct them from per-replicate cache before marking done.
+      method_cache_dir <- file.path(scenario_progress_dir, method_name)
+      need_aggregation <- !(file.exists(method_diag_file) && file.exists(method_file))
+      if (need_aggregation) {
+        cached_rows <- read_cached_replicate_diagnostics(method_cache_dir)
+        if (!is.null(cached_rows) && nrow(cached_rows) > 0) {
+          diag_existing <- NULL
+          if (file.exists(method_diag_file)) {
+            diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
+          }
+          diag_all_cached <- merge_replicate_diagnostics(diag_existing, cached_rows)
+          summary_res <- tryCatch(summarize_single_stage_cf_metrics(diag_all_cached), error = function(e) NULL)
+          if (!is.null(summary_res)) {
+            diag_all <- summary_res$diagnostics
+            write.csv(diag_all, method_diag_file, row.names = FALSE)
+            write.csv(summary_res$summary, method_file, row.names = FALSE)
+            # Delete per-replicate cache files after successful aggregation
+            if (dir.exists(method_cache_dir)) {
+              cache_files <- list.files(method_cache_dir, pattern = "^replicate_\\d+\\.csv$", full.names = TRUE)
+              if (length(cache_files) > 0) file.remove(cache_files)
+            }
+          } else {
+            # Failed to aggregate cached replicates: mark error and abort so scenario is not checkpointed.
+            err_msg <- paste0("aggregation_failed_for_", method_name)
+            method_cp <- rbind(method_cp, data.frame(method = method_name, status = "error", timestamp = as.character(Sys.time()), error = err_msg, stringsAsFactors = FALSE))
+            write.csv(method_cp, method_checkpoint, row.names = FALSE)
+            stop(err_msg)
+          }
+        } else {
+          # No cached replicates to reconstruct from: this is unexpected, abort so work can be inspected.
+          err_msg <- paste0("no_cached_replicates_for_", method_name)
+          method_cp <- rbind(method_cp, data.frame(method = method_name, status = "error", timestamp = as.character(Sys.time()), error = err_msg, stringsAsFactors = FALSE))
+          write.csv(method_cp, method_checkpoint, row.names = FALSE)
+          stop(err_msg)
+        }
+      }
+
+      # Now safe to mark method done and clean up cache directory.
       method_cp <- rbind(
         method_cp,
         data.frame(method = method_name, status = "done", timestamp = as.character(Sys.time()), error = "", stringsAsFactors = FALSE)
       )
       write.csv(method_cp, method_checkpoint, row.names = FALSE)
-      method_cache_dir <- file.path(scenario_progress_dir, method_name)
       if (dir.exists(method_cache_dir)) {
         unlink(method_cache_dir, recursive = TRUE, force = TRUE)
       }
@@ -226,8 +356,8 @@ run_single_file <- function(file) {
     status <- "done"
     tryCatch({
       res <- run_single_stage_cf(
-        datasets = ld$datasets[pending_reps],
-        metadata = ld$metadata[pending_reps, , drop = FALSE],
+        datasets = ld$datasets,
+        metadata = ld$metadata,
         methods = list(method_registry[[method_name]]),
         use_parallel = use_parallel,
         n_reps = reps_to_run,
@@ -250,16 +380,17 @@ run_single_file <- function(file) {
       write.csv(diag_all, method_diag_file, row.names = FALSE)
       write.csv(summary_res$summary, method_file, row.names = FALSE)
 
-      rep_rows <- data.frame(
-        replicate = pending_reps,
-        status = "done",
-        timestamp = as.character(Sys.time()),
-        error = "",
-        stringsAsFactors = FALSE
-      )
-      rep_checkpoint <- merge_replicate_checkpoint(rep_checkpoint, rep_rows)
-      # Replicate checkpoint advances only after diagnostics + summary are saved.
-      write.csv(rep_checkpoint, method_rep_checkpoint, row.names = FALSE)
+      # Delete per-replicate cache files immediately after aggregation to avoid stale data on resume.
+      method_cache_dir <- file.path(scenario_progress_dir, method_name)
+      if (dir.exists(method_cache_dir)) {
+        cache_files <- list.files(method_cache_dir, pattern = "^replicate_\\d+\\.csv$", full.names = TRUE)
+        if (length(cache_files) > 0) {
+          file.remove(cache_files)
+        }
+      }
+
+      # Per-replicate checkpoints are already written atomically by workers; consolidate them for tracking.
+      rep_checkpoint <- consolidate_replicate_checkpoints(method_cache_dir)
     }, error = function(e) {
       status <<- "error"
       msg <<- conditionMessage(e)
@@ -278,8 +409,8 @@ run_single_file <- function(file) {
       stop(msg)
     }
 
-    rep_checkpoint <- read.csv(method_rep_checkpoint, stringsAsFactors = FALSE)
-    completed_reps <- rep_checkpoint$replicate[rep_checkpoint$status == "done"]
+    rep_checkpoint <- consolidate_replicate_checkpoints(file.path(scenario_progress_dir, method_name))
+    completed_reps <- if (!is.null(rep_checkpoint)) rep_checkpoint$replicate[rep_checkpoint$status == "done"] else integer(0)
     if (length(completed_reps) == length(replicate_ids)) {
       method_cp <- rbind(
         method_cp,
@@ -288,6 +419,7 @@ run_single_file <- function(file) {
       write.csv(method_cp, method_checkpoint, row.names = FALSE)
       method_cache_dir <- file.path(scenario_progress_dir, method_name)
       if (dir.exists(method_cache_dir)) {
+        # Clean up per-replicate checkpoint files and remaining cache files
         unlink(method_cache_dir, recursive = TRUE, force = TRUE)
       }
       cat("Method checkpointed:", method_name, "for", scenario_name, "\n")

@@ -4,7 +4,7 @@
 
 packages <- c(
   "foreach", "doParallel", "parsnip", "ranger",
-  "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr"
+  "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr", "jsonlite"
 )
 
 ipak <- function(pkg) {
@@ -17,14 +17,16 @@ ipak <- function(pkg) {
 ipak(packages)
 
 source(file.path("simulations", "complete_data", "scripts", "non_cf", "single_stage_model_helpers.R"))
+source(file.path("helpers", "data_source_helpers.R"))
 
 
-# set environment variables to control data source and syncing behavior
-data_source <- tolower(Sys.getenv("DATA_SOURCE", "archive"))
-archive_dir <- Sys.getenv("ARCHIVE_DATASETS_DIR", "")
-sync_archive <- tolower(Sys.getenv("SYNC_ARCHIVE_TO_LOCAL", "false")) == "true"
-zenodo_url <- Sys.getenv("ZENODO_URL", "")
-zenodo_doi <- Sys.getenv("ZENODO_DOI", "")
+# Set the data source options for the analysis: local data by default, archive only when needed,
+# and regenerate only when explicitly requested.
+data_source <- normalize_data_source(get_runtime_option(c("data_source", "DATA_SOURCE"), "local"), default = "local")
+archive_dir <- get_runtime_option(c("archive_datasets_dir", "ARCHIVE_DATASETS_DIR"), "")
+sync_archive <- normalize_data_source(get_runtime_option(c("sync_archive_to_local", "SYNC_ARCHIVE_TO_LOCAL"), "false"), default = "false") == "true"
+zenodo_url <- get_runtime_option(c("zenodo_data_url", "ZENODO_DATA_URL", "ZENODO_URL"), "")
+zenodo_doi <- get_runtime_option(c("zenodo_data_doi", "ZENODO_DATA_DOI", "ZENODO_DOI"), "")
 
 # define data input and output directories
 local_datasets_dir <- file.path("simulations", "complete_data", "datasets")
@@ -52,44 +54,35 @@ on.exit(sink(), add = TRUE)
 
 # function to resolve the Zenodo URL from either a direct URL or a DOI
 resolve_zenodo_url <- function(doi, url) {
-  if (url != "") {
-    return(url)
-  }
-  if (doi == "") {
-    return("")
-  }
-  doi <- sub("^https?://(dx\\.)?doi\\.org/", "", doi)
-  doi <- sub("^doi:", "", doi)
-  zenodo_id <- sub("^10\\.5281/zenodo\\.", "", doi)
-  paste0("https://zenodo.org/record/", zenodo_id, "/files/complete_data_datasets.zip?download=1")
+  reference <- if (nzchar(url)) url else doi
+  resolve_zenodo_download_url(reference, preferred_file = "Data.zip")
 }
 
 # function to download and unzip archived datasets from a given URL
 download_and_unzip <- function(url, dest_dir) {
   if (url == "") {
-    stop("ZENODO_URL or ZENODO_DOI must be set when ARCHIVE_DATASETS_DIR is empty.")
+    stop("ZENODO data DOI or URL must be set when a local dataset directory is unavailable.")
   }
   if (!dir.exists(dest_dir)) {
     dir.create(dest_dir, recursive = TRUE)
   }
   zip_path <- file.path(dest_dir, "zenodo_datasets.zip")
-  utils::download.file(url, zip_path, mode = "wb", quiet = FALSE)
-  utils::unzip(zip_path, exdir = dest_dir)
+  if (file.exists(url) && grepl("\\.zip$", url, ignore.case = TRUE)) {
+    safe_unzip_archive(url, dest_dir)
+  } else {
+    download_archive_file(url, zip_path)
+    safe_unzip_archive(zip_path, dest_dir)
+  }
   dest_dir
 }
 
 # function to find the directory containing the archived datasets after unzipping
 find_archive_dir <- function(base_dir) {
-  archive_files <- list.files(
-    base_dir,
-    pattern = "^complete_n\\d+_r2_\\d+p\\d+\\.RData$",
-    full.names = TRUE,
-    recursive = TRUE
+  find_archive_root(
+    base_dir = base_dir,
+    file_pattern = "^complete_n\\d+_r2_\\d+p\\d+\\.RData$",
+    parent_levels = 0
   )
-  if (length(archive_files) == 0) {
-    stop(paste("No scenario files found after download in", base_dir))
-  }
-  dirname(archive_files[1])
 }
 
 if (data_source == "regenerate") {
@@ -103,34 +96,42 @@ if (data_source == "regenerate") {
     warning("Regenerating datasets into existing folder: ", local_datasets_dir)
   }
   source(file.path("simulations", "complete_data", "scripts", "generate_complete_data.R"))
-} else if (data_source == "archive") {
-  # allow ARCHIVE_DATASETS_DIR=local to use the repo datasets folder directly
-  if (archive_dir %in% c("local", "local_datasets")) {
-    archive_dir <- local_datasets_dir
-  }
-  if (archive_dir == "") {
-    # Download and unzip archived datasets from Zenodo and save to local directory
-    zenodo_cache <- file.path("simulations", "complete_data", "archives", "zenodo")
-    archive_url <- resolve_zenodo_url(zenodo_doi, zenodo_url)
-    download_and_unzip(archive_url, zenodo_cache)
-    archive_dir <- find_archive_dir(zenodo_cache)
-  }
-  input_dir <- archive_dir
-  if (sync_archive) {
-    cat("Syncing archived datasets into", local_datasets_dir, "\n")
-    if (!dir.exists(local_datasets_dir)) {
-      dir.create(local_datasets_dir, recursive = TRUE)
+} else if (data_source %in% c("archive", "local")) {
+  local_available <- local_dataset_available(local_datasets_dir, "^complete_n\\d+_r2_\\d+p\\d+\\.RData$")
+  if (data_source == "local" && local_available) {
+    input_dir <- local_datasets_dir
+  } else {
+    # Prefer a project-local archive folder if one was supplied; otherwise use the Zenodo DOI.
+    archive_source <- archive_dir
+    if (archive_source %in% c("local", "local_datasets")) {
+      archive_source <- local_datasets_dir
+    } else if (!nzchar(archive_source)) {
+      archive_reference <- if (nzchar(zenodo_url)) zenodo_url else zenodo_doi
+      archive_source <- resolve_zenodo_url(doi = archive_reference, url = zenodo_url)
     }
-    archive_files <- list.files(
-      archive_dir,
-      pattern = "^complete_n\\d+_r2_\\d+p\\d+\\.RData$",
-      full.names = TRUE
-    )
-    file.copy(archive_files, local_datasets_dir, overwrite = TRUE)
+
+    if (!nzchar(archive_source)) {
+      if (local_available) {
+        input_dir <- local_datasets_dir
+      } else {
+        stop("No local complete-data datasets were found and no Zenodo DOI/URL was provided.")
+      }
+    } else if (dir.exists(archive_source)) {
+      input_dir <- find_archive_dir(archive_source)
+    } else {
+      zenodo_cache <- file.path("simulations", "complete_data", "archives", "zenodo")
+      download_and_unzip(archive_source, zenodo_cache)
+      input_dir <- find_archive_dir(zenodo_cache)
+    }
+  }
+
+  if (sync_archive && input_dir != local_datasets_dir) {
+    cat("Syncing archived datasets into", local_datasets_dir, "\n")
+    copy_matching_files(input_dir, local_datasets_dir, "^complete_n\\d+_r2_\\d+p\\d+\\.RData$")
     input_dir <- local_datasets_dir
   }
 } else {
-  stop("DATA_SOURCE must be either 'archive' or 'regenerate'.")
+  stop("DATA_SOURCE must be either 'local', 'archive', or 'regenerate'.")
 }
 
 
@@ -270,8 +271,8 @@ results <- do.call(rbind, lapply(pending_files, function(file_path) {
       status <- "done"
       tryCatch({
         res <- run_single_stage(
-          datasets = scenario$datasets[pending_reps],
-          metadata = scenario$metadata[pending_reps, , drop = FALSE],
+          datasets = scenario$datasets,
+          metadata = scenario$metadata,
           methods = list(method_registry[[method_name]]),
           use_parallel = TRUE,
           cores = parallel::detectCores(logical = TRUE),
@@ -382,6 +383,12 @@ if (length(scenario_files) > 0) {
 }
 
 # Example run (R terminal):
-# DATA_SOURCE=archive ARCHIVE_DATASETS_DIR=/path/to/zenodo/datasets \
-# SYNC_ARCHIVE_TO_LOCAL=true
+# Rscript simulations/complete_data/scripts/non_cf/single_stage_results.R
+#
+# Use an archive if local datasets are absent:
+# zenodo_data_doi="https://doi.org/10.5281/zenodo.19393092" \
+# Rscript simulations/complete_data/scripts/non_cf/single_stage_results.R
+#
+# Use a project-local archive copy if you already unpacked Data.zip:
+# DATA_SOURCE=archive ARCHIVE_DATASETS_DIR=simulations/complete_data/datasets \
 # Rscript simulations/complete_data/scripts/non_cf/single_stage_results.R

@@ -1,2 +1,5 @@
 "method","status","timestamp","error"
-"unadj","error","2026-05-15 02:02:11.983772","task 14 failed - ""no lines available in input"""
+"unadj","done","2026-05-15 12:50:09.432228",NA
+"lm","done","2026-05-15 12:51:52.337683",NA
+"lm_interact","done","2026-05-15 12:53:38.814861",NA
+"rf","done","2026-05-15 15:58:59.894636",""

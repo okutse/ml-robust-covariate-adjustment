@@ -52,8 +52,15 @@ rsconnect/
 simulations/complete_data/datasets/*.RData
 simulations/missing_outcomes/miss_datasets/
 
+# ignore the non_cf scripts from file
+simulations/complete_data/scripts/non_cf/*.R
+
+# similarly ignore the single-stage and two-stage non_cf results from repo
+simulations/complete_data/complete_data_results/single_stage/
+simulations/complete_data/complete_data_results/two_stage/
+
 # ignore all .bash files from repository
-simulations/missing_outcomes/miss_scripts/miss_bash_scripts/*.bash
+# simulations/missing_outcomes/miss_scripts/miss_bash_scripts/*.bash
 
 # ignore complete-data manifests/checkpoints in procedure folders
 simulations/complete_data/complete_data_results/single_stage/input_manifest.csv
@@ -70,7 +77,7 @@ simulations/complete_data/complete_data_results/single_stage/single_stage_checkp
 simulations/complete_data/complete_data_results/two_stage/two_stage_checkpoint.csv
 
 # local sanity checks
-tests/sanity/
+tests/
 
 # renv artifacts
 renv/library/

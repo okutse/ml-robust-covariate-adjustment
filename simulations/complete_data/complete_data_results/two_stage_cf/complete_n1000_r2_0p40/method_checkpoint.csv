@@ -1,0 +1,6 @@
+"method","status","timestamp","error"
+"unadj","done","2026-05-15 13:06:15.50635",NA
+"lm","done","2026-05-15 13:08:06.982293",NA
+"lm_interact","done","2026-05-15 13:10:07.800818",NA
+"rf","error","2026-05-15 13:25:11.894878","replicate_ids contain indices outside the available dataset range."
+"rf","error","2026-05-15 13:29:10.162462","replicate_ids contain indices outside the available dataset range."
