@@ -11,8 +11,55 @@
 # - <setting>_single_stage_<model_spec>_aggregated.csv per model spec
 # - <setting>_single_stage_aggregated.csv across model specs
 
+get_script_path <- function() {
+  args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- args[grepl("^--file=", args)]
+  if (length(file_arg) == 0) {
+    return(NA_character_)
+  }
+  sub("^--file=", "", file_arg[1])
+}
 
-source(file.path("simulations", "missing_outcomes", "miss_scripts", "miss_runner.R"))
+script_path <- get_script_path()
+if (is.na(script_path) || !nzchar(script_path)) {
+  stop("Unable to determine the path to run_missing_single_stage.R.")
+}
+
+project_root <- normalizePath(file.path(dirname(script_path), "..", "..", ".."), winslash = "/", mustWork = TRUE)
+setwd(project_root)
+
+renv_activate <- file.path(project_root, "renv", "activate.R")
+if (file.exists(renv_activate)) {
+  source(renv_activate)
+}
+
+# Fail fast in batch jobs if the project library is not ready before any analysis starts.
+required_packages <- c(
+  "parsnip",
+  "ranger",
+  "dbarts",
+  "SuperLearner",
+  "xgboost",
+  "magrittr",
+  "purrr",
+  "rsample",
+  "dplyr",
+  "foreach",
+  "doParallel",
+  "nnls",
+  "gam",
+  "jsonlite"
+)
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required packages before processing begins: ",
+    paste(missing_packages, collapse = ", "),
+    ". Run `Rscript -e \"renv::restore()\"` from the repository root and resubmit the job."
+  )
+}
+
+source(file.path(project_root, "simulations", "missing_outcomes", "miss_scripts", "miss_runner.R"))
 
 setting_name <- Sys.getenv("SETTING", "setting_three") # can be changed via environment variable, e.g. when running on Slurm or locally with different settings
 model_specs <- c("m1", "m2")

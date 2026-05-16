@@ -22,10 +22,15 @@ required_packages <- c(
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
   renv_lock <- file.path(getwd(), "renv.lock")
-  if (requireNamespace("renv", quietly = TRUE) && file.exists(renv_lock)) {
+  allow_runtime_install <- tolower(Sys.getenv("ALLOW_RUNTIME_PACKAGE_INSTALL", "false")) == "true"
+  if (allow_runtime_install && requireNamespace("renv", quietly = TRUE) && file.exists(renv_lock)) {
     renv::install(missing_packages, prompt = FALSE)
   } else {
-    install.packages(missing_packages, repos = "https://cloud.r-project.org")
+    stop(
+      "Missing required packages before processing begins: ",
+      paste(missing_packages, collapse = ", "),
+      ". Run `Rscript -e \"renv::restore()\"` from the repository root before submitting the batch job."
+    )
   }
 }
 
@@ -33,6 +38,8 @@ invisible(lapply(required_packages, function(pkg) {
   suppressPackageStartupMessages(library(pkg, character.only = TRUE))
 }))
 
+
+# source the main shared helper for resolving path and loading datasets
 source(file.path("helpers", "data_source_helpers.R"))
 
 # Global defaults (override via environment variables as needed).
