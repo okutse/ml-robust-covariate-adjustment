@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=miss_single_stage_drml_bc
-#SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10

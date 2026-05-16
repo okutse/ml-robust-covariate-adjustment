@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=miss_two_stage
-#SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
