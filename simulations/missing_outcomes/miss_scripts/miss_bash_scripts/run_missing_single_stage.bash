@@ -13,6 +13,14 @@
 set -euo pipefail
 module load r/4.5.1
 
+# Run the job from the repository root so renv and project-relative paths resolve correctly.
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/../../../.." && pwd)"
+cd "$project_root"
+
+# Activate renv first, then restore the project library before any analysis code runs.
+Rscript -e 'source("renv/activate.R"); renv::restore(prompt = FALSE)'
+
 # Example:
 # sbatch simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_single_stage.bash
 # SETTING=setting_one DATA_SOURCE=local RESET_CHECKPOINT=true \
