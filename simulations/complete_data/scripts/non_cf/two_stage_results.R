@@ -23,6 +23,13 @@ sync_archive <- normalize_data_source(get_runtime_option(c("sync_archive_to_loca
 zenodo_url <- get_runtime_option(c("zenodo_data_url", "ZENODO_DATA_URL", "ZENODO_URL"), "")
 zenodo_doi <- get_runtime_option(c("zenodo_data_doi", "ZENODO_DATA_DOI", "ZENODO_DOI"), "")
 
+# Use default Zenodo DOI if no local data and no explicit DOI/URL provided.
+# This ensures jobs can proceed without requiring explicit user input for the archive.
+if (!nzchar(zenodo_doi) && !nzchar(zenodo_url)) {
+  zenodo_doi <- "https://doi.org/10.5281/zenodo.19393092"
+  cat("[data-source] No explicit Zenodo DOI/URL provided. Using default complete-data DOI.\n")
+}
+
 local_datasets_dir <- file.path("simulations", "complete_data", "datasets")
 input_dir <- local_datasets_dir
 output_dir <- file.path("simulations", "complete_data", "complete_data_results")

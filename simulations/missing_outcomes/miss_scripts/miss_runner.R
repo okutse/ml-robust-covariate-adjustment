@@ -705,7 +705,10 @@ resolve_missing_input_root <- function() {
     if (local_available) {
       return(input_root)
     }
-    stop("No local missing-outcomes datasets were found and no Zenodo DOI/URL was provided.")
+    # Use default Zenodo DOI if no local data and no explicit DOI/URL provided.
+    # This ensures jobs can proceed without requiring explicit user input for the archive.
+    archive_reference <- "https://doi.org/10.5281/zenodo.19393092"
+    cat("[data-source] No local missing-outcomes data found. Using default Zenodo DOI: ", archive_reference, "\n", sep = "")
   }
 
   zenodo_cache <- file.path("simulations", "missing_outcomes", "archives", "zenodo")

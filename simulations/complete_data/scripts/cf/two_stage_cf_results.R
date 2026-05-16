@@ -68,6 +68,13 @@ sync_archive <- normalize_data_source(get_runtime_option(c("sync_archive_to_loca
 zenodo_url <- get_runtime_option(c("zenodo_data_url", "ZENODO_DATA_URL", "ZENODO_URL"), "")
 zenodo_doi <- get_runtime_option(c("zenodo_data_doi", "ZENODO_DATA_DOI", "ZENODO_DOI"), "")
 
+# Use default Zenodo DOI if no local data and no explicit DOI/URL provided.
+# This ensures jobs can proceed without requiring explicit user input for the archive.
+if (!nzchar(zenodo_doi) && !nzchar(zenodo_url)) {
+  zenodo_doi <- "https://doi.org/10.5281/zenodo.19393092"
+  cat("[data-source] No explicit Zenodo DOI/URL provided. Using default complete-data DOI.\n")
+}
+
 resolve_zenodo_url <- function(doi, url) {
   reference <- if (nzchar(url)) url else doi
   resolve_zenodo_download_url(reference, preferred_file = "Data.zip")
