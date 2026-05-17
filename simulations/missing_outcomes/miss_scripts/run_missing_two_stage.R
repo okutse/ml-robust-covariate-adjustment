@@ -42,8 +42,7 @@ run_procedure_for_setting(
   setting_name = setting_name,
   procedure_name = "two_stage",
   model_specs = model_specs,
-  use_parallel = TRUE,
-  cores = parallel::detectCores(logical = TRUE)
+  use_parallel = TRUE
 )
 
 # Example run:

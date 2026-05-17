@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
-#SBATCH --mem=64G
+#SBATCH --mem=115G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/missing_outcomes/two_stage_%A.out
 #SBATCH --error=logs/missing_outcomes/two_stage_%A.err

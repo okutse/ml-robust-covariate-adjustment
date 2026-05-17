@@ -123,6 +123,35 @@ log_progress_line <- function(log_file, line) {
   }
 }
 
+safe_read_csv <- function(path, ...) {
+  if (is.null(path) || !nzchar(path) || !file.exists(path)) {
+    return(NULL)
+  }
+
+  size <- suppressWarnings(file.info(path)$size)
+  if (is.na(size) || size <= 0) {
+    cat("[checkpoint] Skipping empty CSV file:", path, "\n")
+    return(NULL)
+  }
+
+  out <- tryCatch(
+    read.csv(path, stringsAsFactors = FALSE, ...),
+    error = function(e) {
+      msg <- conditionMessage(e)
+      if (grepl("no lines available in input|line 1 did not have", msg, ignore.case = TRUE)) {
+        cat("[checkpoint] Skipping unreadable/truncated CSV file:", path, "-", msg, "\n")
+        return(NULL)
+      }
+      stop(e)
+    }
+  )
+
+  if (is.null(out) || !is.data.frame(out) || nrow(out) == 0) {
+    return(NULL)
+  }
+  out
+}
+
 write_replicate_cache <- function(method_dir, rep_row) {
   if (is.null(method_dir) || !nzchar(method_dir)) {
     return(invisible(NULL))
@@ -161,11 +190,18 @@ consolidate_replicate_checkpoints <- function(method_dir) {
   combined_list <- list()
   combined_file <- file.path(method_dir, "replicate_checkpoint.csv")
   if (file.exists(combined_file)) {
-    combined_list[[length(combined_list) + 1]] <- read.csv(combined_file, stringsAsFactors = FALSE)
+    combined_cp <- safe_read_csv(combined_file)
+    if (!is.null(combined_cp)) {
+      combined_list[[length(combined_list) + 1]] <- combined_cp
+    }
   }
   checkpoint_files <- list.files(method_dir, pattern = "^replicate_\\d+_checkpoint\\.csv$", full.names = TRUE)
   if (length(checkpoint_files) > 0) {
-    combined_list <- c(combined_list, lapply(checkpoint_files, function(f) read.csv(f, stringsAsFactors = FALSE)))
+    checkpoint_rows <- lapply(checkpoint_files, safe_read_csv)
+    checkpoint_rows <- checkpoint_rows[!vapply(checkpoint_rows, is.null, logical(1))]
+    if (length(checkpoint_rows) > 0) {
+      combined_list <- c(combined_list, checkpoint_rows)
+    }
   }
   if (length(combined_list) == 0) return(NULL)
   combined <- do.call(rbind, combined_list)
@@ -184,7 +220,12 @@ read_cached_replicate_diagnostics <- function(method_progress_dir) {
   if (length(files) == 0) {
     return(NULL)
   }
-  do.call(rbind, lapply(files, read.csv, stringsAsFactors = FALSE))
+  rows <- lapply(files, safe_read_csv)
+  rows <- rows[!vapply(rows, is.null, logical(1))]
+  if (length(rows) == 0) {
+    return(NULL)
+  }
+  do.call(rbind, rows)
 }
 
 normalize_missing_metadata <- function(datasets, metadata, file_path = NULL) {
@@ -351,11 +392,24 @@ run_all_models_for_dataset <- function(
   }
 
   if (is.null(cores)) {
-    cores <- parallel::detectCores(logical = TRUE)
+    cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", parallel::detectCores(logical = TRUE)))
+  }
+  if (is.na(cores) || cores < 1) {
+    cores <- 1L
   }
 
   if (use_parallel) {
-    doParallel::registerDoParallel(max(1, cores - 1))
+    Sys.setenv(OMP_NUM_THREADS = "1", MKL_NUM_THREADS = "1")
+    slurm_cpus <- Sys.getenv("SLURM_CPUS_PER_TASK", "")
+    workers <- max(1, cores - 1)
+    cat(
+      "[parallel] Cores available: ", cores,
+      ", Registered workers: ", workers,
+      ", SLURM_CPUS_PER_TASK: ", if (nzchar(slurm_cpus)) slurm_cpus else "(not set)",
+      ", OMP_NUM_THREADS=1, MKL_NUM_THREADS=1\n",
+      sep = ""
+    )
+    doParallel::registerDoParallel(workers)
     `%op%` <- foreach::`%dopar%`
   } else {
     foreach::registerDoSEQ()
@@ -797,8 +851,10 @@ run_procedure_for_setting <- function(
 
     processed_files <- character(0)
     if (file.exists(scenario_checkpoint)) {
-      processed <- read.csv(scenario_checkpoint, stringsAsFactors = FALSE)
-      processed_files <- processed$file
+      processed <- safe_read_csv(scenario_checkpoint)
+      if (!is.null(processed) && "file" %in% names(processed)) {
+        processed_files <- processed$file
+      }
     }
     pending_files <- input_files[!basename(input_files) %in% processed_files]
 
@@ -825,7 +881,10 @@ run_procedure_for_setting <- function(
 
       method_checkpoint <- file.path(scenario_dir, "method_checkpoint.csv")
       if (file.exists(method_checkpoint)) {
-        method_cp <- read.csv(method_checkpoint, stringsAsFactors = FALSE)
+        method_cp <- safe_read_csv(method_checkpoint)
+        if (is.null(method_cp)) {
+          method_cp <- data.frame(method = character(), status = character(), timestamp = character(), error = character(), stringsAsFactors = FALSE)
+        }
         completed_methods <- method_cp$method[method_cp$status == "done"]
       } else {
         method_cp <- data.frame(method = character(), status = character(), timestamp = character(), error = character(), stringsAsFactors = FALSE)
@@ -865,7 +924,7 @@ run_procedure_for_setting <- function(
             if (!is.null(cached_rows) && nrow(cached_rows) > 0) {
               diag_existing <- NULL
               if (file.exists(method_diag_file)) {
-                diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
+                diag_existing <- safe_read_csv(method_diag_file)
               }
               diag_all_cached <- merge_replicate_diagnostics(diag_existing, cached_rows)
               summary_res <- tryCatch(summarize_missing_replicates(diag_all_cached, metadata), error = function(e) NULL)
@@ -933,7 +992,7 @@ run_procedure_for_setting <- function(
           diag_new <- attr(results, "replicate_diagnostics")
           diag_existing <- NULL
           if (file.exists(method_diag_file)) {
-            diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
+            diag_existing <- safe_read_csv(method_diag_file)
           }
           diag_all <- merge_replicate_diagnostics(diag_existing, diag_new)
           summary_res <- summarize_missing_replicates(diag_all, metadata)
@@ -983,11 +1042,19 @@ run_procedure_for_setting <- function(
       method_files <- list.files(scenario_dir, pattern = "_results\\.csv$", full.names = TRUE)
       scenario_file <- file.path(scenario_dir, paste0(scenario_name, "_results.csv"))
       if (length(method_files) > 0) {
-        scenario_agg <- do.call(rbind, lapply(method_files, read.csv, stringsAsFactors = FALSE))
+        method_rows <- lapply(method_files, safe_read_csv)
+        method_rows <- method_rows[!vapply(method_rows, is.null, logical(1))]
+        if (length(method_rows) == 0) {
+          stop("All method-level result files were empty or unreadable while aggregating scenario results.")
+        }
+        scenario_agg <- do.call(rbind, method_rows)
         scenario_agg <- recompute_missing_relative_efficiency(scenario_agg)
         write.csv(scenario_agg, file = scenario_file, row.names = FALSE)
       } else if (file.exists(scenario_file)) {
-        scenario_agg <- read.csv(scenario_file, stringsAsFactors = FALSE)
+        scenario_agg <- safe_read_csv(scenario_file)
+        if (is.null(scenario_agg)) {
+          stop("Scenario result file exists but is empty or unreadable: ", scenario_file)
+        }
         scenario_agg <- recompute_missing_relative_efficiency(scenario_agg)
         write.csv(scenario_agg, file = scenario_file, row.names = FALSE)
       }
@@ -995,7 +1062,10 @@ run_procedure_for_setting <- function(
       scenario_row <- data.frame(file = basename(file_path), status = "done", timestamp = as.character(Sys.time()), error = "", stringsAsFactors = FALSE)
       # Use atomic read-modify-write to avoid race conditions with concurrent writes
       if (file.exists(scenario_checkpoint)) {
-        scenario_cp <- read.csv(scenario_checkpoint, stringsAsFactors = FALSE)
+        scenario_cp <- safe_read_csv(scenario_checkpoint)
+        if (is.null(scenario_cp)) {
+          scenario_cp <- data.frame(file = character(), status = character(), timestamp = character(), error = character(), stringsAsFactors = FALSE)
+        }
         scenario_cp <- rbind(scenario_cp, scenario_row)
         scenario_cp <- scenario_cp[!duplicated(scenario_cp$file, fromLast = TRUE), , drop = FALSE]
         write.csv(scenario_cp, scenario_checkpoint, row.names = FALSE)
@@ -1008,7 +1078,12 @@ run_procedure_for_setting <- function(
     scenario_files <- list.files(model_dir, pattern = "_results\\.csv$", full.names = TRUE, recursive = TRUE)
     scenario_files <- scenario_files[!grepl("_replicate_diagnostics\\.csv$", scenario_files)]
     if (length(scenario_files) > 0) {
-      aggregated <- do.call(rbind, lapply(scenario_files, read.csv, stringsAsFactors = FALSE))
+      scenario_rows <- lapply(scenario_files, safe_read_csv)
+      scenario_rows <- scenario_rows[!vapply(scenario_rows, is.null, logical(1))]
+      if (length(scenario_rows) == 0) {
+        stop("All scenario result files were empty or unreadable while building model-level aggregate.")
+      }
+      aggregated <- do.call(rbind, scenario_rows)
       aggregated_file <- file.path(model_dir, paste0(setting_name, "_", procedure_name, "_", model_spec, "_aggregated.csv"))
       write.csv(aggregated, file = aggregated_file, row.names = FALSE)
       all_aggregated[[model_spec]] <- aggregated
