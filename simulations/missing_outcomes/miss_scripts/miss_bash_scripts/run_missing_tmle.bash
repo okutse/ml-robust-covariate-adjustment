@@ -25,4 +25,4 @@ Rscript -e 'source("renv/activate.R"); renv::restore(prompt = FALSE)'
 # SETTING=setting_one DATA_SOURCE=local RESET_CHECKPOINT=true \
 # sbatch --export=SETTING,DATA_SOURCE,RESET_CHECKPOINT simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_tmle.bash
 
-Rscript simulations/missing_outcomes/miss_scripts/run_missing_tmle.R
+DATA_SOURCE=archive ARCHIVE_DATASETS_DIR=simulations/missing_outcomes/archives/zenodo/zenodo_datasets.zip Rscript simulations/missing_outcomes/miss_scripts/run_missing_tmle.R

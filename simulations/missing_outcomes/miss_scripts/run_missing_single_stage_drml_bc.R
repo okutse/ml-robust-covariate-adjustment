@@ -53,7 +53,7 @@ run_procedure_for_setting(
 # Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R
 #
 # Force a local archive folder if you already unpacked Data.zip:
-# SETTING=setting_three DATA_SOURCE=archive ARCHIVE_DATASETS_DIR=simulations/missing_outcomes/miss_datasets RESET_CHECKPOINT=true \
+# SETTING=setting_three DATA_SOURCE=archive ARCHIVE_DATASETS_DIR=simulations/missing_outcomes/archives/zenodo/zenodo_datasets.zip RESET_CHECKPOINT=true \
 # Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R
 
 # Slurm one-liner example (adjust partition/resources as needed):
