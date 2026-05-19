@@ -85,7 +85,10 @@ download_and_unzip <- function(url, dest_dir) {
     dir.create(dest_dir, recursive = TRUE)
   }
   zip_path <- file.path(dest_dir, "zenodo_datasets.zip")
-  if (file.exists(url) && grepl("\\.zip$", url, ignore.case = TRUE)) {
+  # Reuse a previously downloaded archive from the cache directory to avoid redundant downloads.
+  if (file.exists(zip_path)) {
+    safe_unzip_archive(zip_path, dest_dir)
+  } else if (file.exists(url) && grepl("\\.zip$", url, ignore.case = TRUE)) {
     safe_unzip_archive(url, dest_dir)
   } else {
     download_archive_file(url, zip_path)
@@ -361,26 +364,73 @@ run_single_file <- function(file) {
     method_start <- Sys.time()
     msg <- ""
     status <- "done"
-    tryCatch({
-      res <- run_single_stage_cf(
-        datasets = ld$datasets,
-        metadata = ld$metadata,
-        methods = list(method_registry[[method_name]]),
-        use_parallel = use_parallel,
-        n_reps = reps_to_run,
-        bootstrap_reps = bootstrap_reps,
-        bootstrap_seed = bootstrap_seed,
-        replicate_ids = pending_reps,
-        progress_dir = scenario_progress_dir,
-        log_file = log_file
-      )
+    method_cache_dir <- file.path(scenario_progress_dir, method_name)
+    # Retry transient worker failures by rerunning only the remaining incomplete replicates.
+    max_attempts <- suppressWarnings(as.integer(Sys.getenv("REPLICATE_RETRIES", "2")))
+    if (is.na(max_attempts) || max_attempts < 1) {
+      max_attempts <- 1L
+    }
+    attempt <- 1L
+    pending <- pending_reps
+    diag_accum <- NULL
+    while (attempt <= max_attempts && length(pending) > 0) {
+      cat(sprintf("[retry] %s/%s attempt %d with %d pending replicates\n", scenario_name, method_name, attempt, length(pending)))
+      tryCatch({
+        res <- run_single_stage_cf(
+          datasets = ld$datasets,
+          metadata = ld$metadata,
+          methods = list(method_registry[[method_name]]),
+          use_parallel = use_parallel,
+          n_reps = reps_to_run,
+          bootstrap_reps = bootstrap_reps,
+          bootstrap_seed = bootstrap_seed,
+          replicate_ids = pending,
+          progress_dir = scenario_progress_dir,
+          log_file = log_file
+        )
+        diag_new <- attr(res, "replicate_diagnostics")
+        if (!is.null(diag_new) && nrow(diag_new) > 0) {
+          if (is.null(diag_accum)) {
+            diag_accum <- diag_new
+          } else {
+            diag_accum <- merge_replicate_diagnostics(diag_accum, diag_new)
+          }
+        }
+      }, error = function(e) {
+        # Keep processing alive: record error and retry only unfinished replicates.
+        status <<- "error"
+        msg <<- conditionMessage(e)
+      })
 
-      diag_new <- attr(res, "replicate_diagnostics")
+      rep_checkpoint <- consolidate_replicate_checkpoints(method_cache_dir)
+      completed_reps <- if (!is.null(rep_checkpoint)) rep_checkpoint$replicate[rep_checkpoint$status == "done"] else integer(0)
+      pending <- setdiff(replicate_ids, completed_reps)
+      if (length(pending) > 0) {
+        cat(sprintf("[retry] %s/%s has %d replicates still pending after attempt %d\n", scenario_name, method_name, length(pending), attempt))
+      }
+      attempt <- attempt + 1L
+    }
+
+    if (length(pending) > 0) {
+      status <- "error"
+      if (!nzchar(msg)) {
+        msg <- sprintf("replicate retries exhausted; %d replicates remain pending", length(pending))
+      }
+    } else {
+      status <- "done"
+      msg <- ""
+    }
+
+    if (status == "done") {
       diag_existing <- NULL
       if (file.exists(method_diag_file)) {
         diag_existing <- read.csv(method_diag_file, stringsAsFactors = FALSE)
       }
-      diag_all <- merge_replicate_diagnostics(diag_existing, diag_new)
+      cached_diag <- read_cached_replicate_diagnostics(method_cache_dir)
+      diag_all <- merge_replicate_diagnostics(diag_existing, cached_diag)
+      if (!is.null(diag_accum)) {
+        diag_all <- merge_replicate_diagnostics(diag_all, diag_accum)
+      }
       summary_res <- summarize_single_stage_cf_metrics(diag_all)
       diag_all <- summary_res$diagnostics
       # Persist diagnostics before marking checkpoints so resume has data to aggregate.
@@ -388,7 +438,6 @@ run_single_file <- function(file) {
       write.csv(summary_res$summary, method_file, row.names = FALSE)
 
       # Delete per-replicate cache files immediately after aggregation to avoid stale data on resume.
-      method_cache_dir <- file.path(scenario_progress_dir, method_name)
       if (dir.exists(method_cache_dir)) {
         cache_files <- list.files(method_cache_dir, pattern = "^replicate_\\d+\\.csv$", full.names = TRUE)
         if (length(cache_files) > 0) {
@@ -398,10 +447,7 @@ run_single_file <- function(file) {
 
       # Per-replicate checkpoints are already written atomically by workers; consolidate them for tracking.
       rep_checkpoint <- consolidate_replicate_checkpoints(method_cache_dir)
-    }, error = function(e) {
-      status <<- "error"
-      msg <<- conditionMessage(e)
-    })
+    }
 
     method_elapsed <- as.numeric(difftime(Sys.time(), method_start, units = "secs"))
     cat("Running method:", method_name, "completed in", round(method_elapsed, 2), "sec\n")

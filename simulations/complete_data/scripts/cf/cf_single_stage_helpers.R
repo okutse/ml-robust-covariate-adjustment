@@ -369,12 +369,22 @@ run_single_stage_cf <- function(
     methods <- get_single_stage_cf_registry()
   }
   if (is.null(cores)) {
-    cores <- parallel::detectCores(logical = TRUE)
+    # Prefer Slurm-assigned CPUs when available so workers respect scheduler limits.
+    slurm_cpus_env <- Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA_character_)
+    if (!is.na(slurm_cpus_env) && nzchar(slurm_cpus_env)) {
+      cores <- as.integer(slurm_cpus_env)
+    } else {
+      cores <- parallel::detectCores(logical = TRUE)
+    }
+  }
+  if (is.na(cores) || cores < 1) {
+    cores <- 1L
   }
   # Keep the CI critical value explicit so the nominal level is configurable.
   z_crit <- stats::qnorm((1 + ci_level) / 2)
 
   if (use_parallel) {
+    # Keep one core free for the orchestrating process to reduce contention.
     doParallel::registerDoParallel(max(1, cores - 1))
     `%op%` <- foreach::`%dopar%`
   } else {

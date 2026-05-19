@@ -2,7 +2,7 @@
 #SBATCH --job-name=miss_single_stage_drml_bc
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=11
 #SBATCH --mem=115G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/missing_outcomes/single_stage_drml_bc_%A.out

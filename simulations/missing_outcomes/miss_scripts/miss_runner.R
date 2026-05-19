@@ -181,6 +181,25 @@ write_replicate_cache <- function(method_dir, rep_row) {
   }
 }
 
+write_replicate_error <- function(method_dir, rep_id, error_msg) {
+  if (is.null(method_dir) || !nzchar(method_dir)) {
+    return(invisible(NULL))
+  }
+  if (!dir.exists(method_dir)) {
+    dir.create(method_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  checkpoint_file <- file.path(method_dir, sprintf("replicate_%s_checkpoint.csv", rep_id))
+  checkpoint_row <- data.frame(
+    replicate = rep_id,
+    status = "error",
+    timestamp = as.character(Sys.time()),
+    error = as.character(substring(error_msg, 1, 2000)),
+    stringsAsFactors = FALSE
+  )
+  write.csv(checkpoint_row, checkpoint_file, row.names = FALSE)
+  invisible(NULL)
+}
+
 consolidate_replicate_checkpoints <- function(method_dir) {
   # Merge per-replicate checkpoint files into a single consolidated checkpoint.
   # Called at read time to avoid race conditions from concurrent writes.
@@ -392,7 +411,12 @@ run_all_models_for_dataset <- function(
   }
 
   if (is.null(cores)) {
-    cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", parallel::detectCores(logical = TRUE)))
+    slurm_cpus_env <- Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA_character_)
+    if (!is.na(slurm_cpus_env) && nzchar(slurm_cpus_env)) {
+      cores <- as.integer(slurm_cpus_env)
+    } else {
+      cores <- parallel::detectCores(logical = TRUE)
+    }
   }
   if (is.na(cores) || cores < 1) {
     cores <- 1L
@@ -774,7 +798,10 @@ resolve_missing_input_root <- function() {
     dir.create(zenodo_cache, recursive = TRUE)
   }
   zip_path <- file.path(zenodo_cache, "zenodo_datasets.zip")
-  download_archive_file(archive_url, zip_path)
+  # Reuse a previously downloaded archive from the cache directory to avoid redundant downloads.
+  if (!file.exists(zip_path)) {
+    download_archive_file(archive_url, zip_path)
+  }
   safe_unzip_archive(zip_path, zenodo_cache)
   find_archive_root(
     base_dir = zenodo_cache,
@@ -966,55 +993,110 @@ run_procedure_for_setting <- function(
         msg <- ""
         status <- "done"
 
-        tryCatch({
-          results <- run_all_models_for_dataset(
-            datasets = datasets,
-            metadata = metadata,
-            procedure_name = procedure_name,
-            model_spec = model_spec,
-            covariate_registry = covariate_registry,
-            procedure_registry = procedure_registry,
-            model_registry = setNames(list(model_registry[[method_name]]), method_name),
-            n_reps = reps_to_run,
-            bootstrap_reps = bootstrap_reps,
-            bootstrap_seed = bootstrap_seed,
-            cf_folds = cf_folds,
-            true_effect = true_effect,
-            null_effect = null_effect,
-            ci_level = ci_level,
-            use_parallel = use_parallel,
-            cores = cores,
-            replicate_ids = pending_reps,
-            progress_dir = scenario_progress_dir,
-            log_file = log_path
-          )
+        # Attempt the replicate pass with bounded retries so transient worker failures
+        # (node OOMs, temporary I/O errors, or single-worker crashes) don't abort the whole job.
+        max_attempts <- suppressWarnings(as.integer(Sys.getenv("REPLICATE_RETRIES", "2")))
+        if (is.na(max_attempts) || max_attempts < 1) {
+          max_attempts <- 1L
+        }
+        attempt <- 1L
+        results <- NULL
+        diag_accum <- NULL
+        pending <- pending_reps
+        last_err_msg <- ""
+        while (attempt <= max_attempts && length(pending) > 0) {
+          cat(sprintf("[retry] %s/%s/%s attempt %d with %d pending replicates\n", setting_name, scenario_name, method_name, attempt, length(pending)))
+          tryCatch({
+            res <- run_all_models_for_dataset(
+              datasets = datasets,
+              metadata = metadata,
+              procedure_name = procedure_name,
+              model_spec = model_spec,
+              covariate_registry = covariate_registry,
+              procedure_registry = procedure_registry,
+              model_registry = setNames(list(model_registry[[method_name]]), method_name),
+              n_reps = reps_to_run,
+              bootstrap_reps = bootstrap_reps,
+              bootstrap_seed = bootstrap_seed,
+              cf_folds = cf_folds,
+              true_effect = true_effect,
+              null_effect = null_effect,
+              ci_level = ci_level,
+              use_parallel = use_parallel,
+              cores = cores,
+              replicate_ids = pending,
+              progress_dir = scenario_progress_dir,
+              log_file = log_path
+            )
 
-          diag_new <- attr(results, "replicate_diagnostics")
+            # Accumulate diagnostics from successful attempt outputs.
+            if (is.null(results)) {
+              results <- res
+            } else {
+              results <- rbind(results, res)
+            }
+            dn <- attr(res, "replicate_diagnostics")
+            if (!is.null(dn) && nrow(dn) > 0) {
+              if (is.null(diag_accum)) {
+                diag_accum <- dn
+              } else {
+                diag_accum <- merge_replicate_diagnostics(diag_accum, dn)
+              }
+            }
+          }, error = function(e) {
+            last_err_msg <<- conditionMessage(e)
+          })
+
+          # Update pending from per-replicate checkpoints written by workers.
+          rep_checkpoint <- NULL
+          if (!is.null(method_progress_dir) && dir.exists(method_progress_dir)) {
+            rep_checkpoint <- consolidate_replicate_checkpoints(method_progress_dir)
+          }
+          completed_reps <- if (!is.null(rep_checkpoint)) rep_checkpoint$replicate[rep_checkpoint$status == "done"] else integer(0)
+          pending <- setdiff(replicate_ids, completed_reps)
+          if (length(pending) > 0) {
+            cat(sprintf("[retry] %s/%s/%s has %d replicates still pending after attempt %d\n", setting_name, scenario_name, method_name, length(pending), attempt))
+          }
+          attempt <- attempt + 1L
+        }
+
+        if (length(pending) > 0) {
+          status <- "error"
+          if (!nzchar(last_err_msg)) {
+            last_err_msg <- sprintf("replicate retries exhausted; %d replicates remain pending", length(pending))
+          }
+          msg <- last_err_msg
+        } else {
+          status <- "done"
+          msg <- ""
+
+          # persist aggregated diagnostics and results (merge with existing files)
+          diag_new <- diag_accum
           diag_existing <- NULL
           if (file.exists(method_diag_file)) {
             diag_existing <- safe_read_csv(method_diag_file)
           }
-          diag_all <- merge_replicate_diagnostics(diag_existing, diag_new)
-          summary_res <- summarize_missing_replicates(diag_all, metadata)
-          diag_all <- summary_res$diagnostics
-          # Persist diagnostics before marking checkpoints so resume has data to aggregate.
-          write.csv(summary_res$summary, file = method_file, row.names = FALSE)
-          write.csv(diag_all, method_diag_file, row.names = FALSE)
-
-          # Delete per-replicate cache files immediately after aggregation to avoid stale data on resume.
-          if (dir.exists(method_progress_dir)) {
-            cache_files <- list.files(method_progress_dir, pattern = "^replicate_\\d+\\.csv$", full.names = TRUE)
-            if (length(cache_files) > 0) {
-              file.remove(cache_files)
-            }
+          cached_diag <- read_cached_replicate_diagnostics(method_progress_dir)
+          diag_all <- merge_replicate_diagnostics(diag_existing, cached_diag)
+          if (!is.null(diag_new)) {
+            diag_all <- tryCatch(merge_replicate_diagnostics(diag_all, diag_new), error = function(e) diag_new)
+          }
+          summary_res <- tryCatch(summarize_missing_replicates(diag_all, metadata), error = function(e) NULL)
+          if (!is.null(summary_res)) {
+            diag_all2 <- summary_res$diagnostics
+            write.csv(summary_res$summary, file = method_file, row.names = FALSE)
+            write.csv(diag_all2, method_diag_file, row.names = FALSE)
           }
 
-          # Per-replicate checkpoints are already written atomically by workers; consolidate them for tracking.
+          # delete per-replicate cache files after successful aggregation
+          if (dir.exists(method_progress_dir)) {
+            cache_files <- list.files(method_progress_dir, pattern = "^replicate_\\d+\\.csv$", full.names = TRUE)
+            if (length(cache_files) > 0) file.remove(cache_files)
+          }
+
+          # consolidate final checkpoint view
           rep_checkpoint <- consolidate_replicate_checkpoints(method_progress_dir)
-        }, error = function(e) {
-          status <<- "error"
-          msg <<- conditionMessage(e)
-        })
+        }
 
         method_elapsed <- as.numeric(difftime(Sys.time(), method_start, units = "secs"))
         cat("Running method:", method_name, "completed in", round(method_elapsed, 2), "sec\n")

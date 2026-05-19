@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=miss_single_stage
+#SBATCH --job-name=single_stage_cf
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=11
 #SBATCH --mem=115G
 #SBATCH --time=48:00:00
-#SBATCH --output=logs/missing_outcomes/single_stage_%A.out
-#SBATCH --error=logs/missing_outcomes/single_stage_%A.err
+#SBATCH --output=logs/complete_data/single_stage_cf_%A.out
+#SBATCH --error=logs/complete_data/single_stage_cf_%A.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=amos_okutse@brown.edu
 
@@ -21,8 +21,8 @@ cd "$project_root"
 Rscript -e 'source("renv/activate.R"); renv::restore(prompt = FALSE)'
 
 # Example:
-# sbatch simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_single_stage.bash
-# SETTING=setting_one DATA_SOURCE=local RESET_CHECKPOINT=true \
-# sbatch --export=SETTING,DATA_SOURCE,RESET_CHECKPOINT simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_single_stage.bash
+# sbatch simulations/complete_data/scripts/cf_bash_scripts/run_single_stage_cf.bash
+# DATA_SOURCE=local RESET_CHECKPOINT=true REPLICATE_RETRIES=3 \
+# sbatch --export=DATA_SOURCE,RESET_CHECKPOINT,REPLICATE_RETRIES simulations/complete_data/scripts/cf_bash_scripts/run_single_stage_cf.bash
 
-Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage.R
+Rscript simulations/complete_data/scripts/cf/single_stage_cf_results.R

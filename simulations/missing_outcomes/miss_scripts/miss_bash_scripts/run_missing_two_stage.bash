@@ -2,7 +2,7 @@
 #SBATCH --job-name=miss_two_stage
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=10
+#SBATCH --cpus-per-task=11
 #SBATCH --mem=115G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/missing_outcomes/two_stage_%A.out
