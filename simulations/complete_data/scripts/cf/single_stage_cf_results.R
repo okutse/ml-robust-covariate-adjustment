@@ -226,7 +226,7 @@ read_cached_replicate_diagnostics <- function(method_progress_dir) {
     return(NULL)
   }
   rows <- lapply(files, function(f) read.csv(f, stringsAsFactors = FALSE))
-  rows <- rows[!vapply(rows, is.null, function(x) is.null(x))]
+  rows <- rows[!vapply(rows, is.null, logical(1))]
   if (length(rows) == 0) return(NULL)
   # Remove transient 'se_method' column if present in any cached files.
   rows <- lapply(rows, function(df) {
