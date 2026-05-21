@@ -2,6 +2,16 @@
 
 source(file.path("simulations", "missing_outcomes", "miss_model_helpers", "sl_dbarts_helpers.R"))
 
+# Keep threaded learners from multiplying the Slurm allocation.
+Sys.setenv(OMP_NUM_THREADS = "1", MKL_NUM_THREADS = "1")
+
+# Control the BART variance estimator globally across scripts.
+# Supported values: "bootstrap" (default) or "posterior".
+BART_VARIANCE_METHOD <- tolower(Sys.getenv("BART_VARIANCE_METHOD", "bootstrap"))
+if (!BART_VARIANCE_METHOD %in% c("bootstrap", "posterior")) {
+  BART_VARIANCE_METHOD <- "bootstrap"
+}
+
 # Default CF settings for missing-outcome procedures (can be overridden upstream).
 if (!exists("CF_FOLDS")) {
   CF_FOLDS <- 2
@@ -205,7 +215,7 @@ get_model_registry <- function() {
         formula <- build_formula(outcome, covariates)
         rand_forest() %>%
           set_mode("regression") %>%
-          set_engine("ranger") %>%
+          set_engine("ranger", num.threads = 1L) %>%
           fit(formula = formula, data = df_obs)
       },
       predict = function(fit, newdata, ...) {
@@ -223,13 +233,71 @@ get_model_registry <- function() {
       predict = function(fit, newdata, ...) {
         as.numeric(predict(fit, newdata)$.pred)
       }
+      ,
+      # Posterior-based standard error for the causal contrast using BART posterior draws.
+      # Returns a list with 'se' and optionally 'mean' and 'time_sec'.
+      posterior_se = function(df, outcome, covariates, n_samples = 1000, ...) {
+        if (!requireNamespace("dbarts", quietly = TRUE)) {
+          stop("dbarts is required for posterior_se on BART")
+        }
+        # Prepare training data (observed outcomes only)
+        train <- df[df$R == 1, , drop = FALSE]
+        if (nrow(train) == 0) return(list(se = NA_real_, mean = NA_real_, time_sec = 0))
+        X_train <- as.data.frame(train[, covariates, drop = FALSE])
+        X_train[] <- lapply(X_train, as.numeric)
+        Y_train <- as.numeric(train[[outcome]])
+
+        X_full <- as.data.frame(df[, covariates, drop = FALSE])
+        X_full[] <- lapply(X_full, as.numeric)
+
+        start_time <- Sys.time()
+        # dbarts uses 'ndpost' for number of posterior draws and 'nskip' for burn-in
+        fit_obj <- dbarts::bart(x.train = as.matrix(X_train), y.train = Y_train, keeptrees = TRUE, verbose = FALSE, ndpost = n_samples, nskip = max(100, floor(n_samples/10)))
+
+        # Counterfactual design matrices
+        X1 <- X_full; X1$A <- 1
+        X0 <- X_full; X0$A <- 0
+
+        pred1_raw <- tryCatch(predict(fit_obj, newdata = as.matrix(X1)), error = function(e) NULL)
+        pred0_raw <- tryCatch(predict(fit_obj, newdata = as.matrix(X0)), error = function(e) NULL)
+
+        reduce_to_samples <- function(pred_raw, n_obs) {
+          if (is.null(pred_raw)) return(NULL)
+          if (is.null(dim(pred_raw))) {
+            # single vector
+            return(matrix(as.numeric(pred_raw), nrow = 1, ncol = length(pred_raw)))
+          }
+          if (nrow(pred_raw) == n_obs) {
+            # rows correspond to observations, cols to posterior samples => transpose
+            return(t(pred_raw))
+          }
+          if (ncol(pred_raw) == n_obs) {
+            # rows correspond to posterior samples, cols to observations
+            return(pred_raw)
+          }
+          # Fallback: coerce to matrix with one row
+          return(matrix(as.numeric(pred_raw), nrow = 1))
+        }
+
+        n_obs <- nrow(X_full)
+        samples1 <- reduce_to_samples(pred1_raw, n_obs)
+        samples0 <- reduce_to_samples(pred0_raw, n_obs)
+        time_sec <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+
+        if (is.null(samples1) || is.null(samples0) || nrow(samples1) != nrow(samples0)) {
+          return(list(se = NA_real_, mean = NA_real_, time_sec = time_sec))
+        }
+
+        tau_samples <- rowMeans(samples1 - samples0)
+        list(se = stats::sd(tau_samples), mean = mean(tau_samples), time_sec = time_sec)
+      }
     ),
     xgboost = list(
       name = "xgboost",
       fit = function(df_obs, outcome, covariates, ...) {
         formula <- build_formula(outcome, covariates)
         parsnip::boost_tree(mode = "regression") %>%
-          set_engine("xgboost", objective = "reg:squarederror") %>%
+          set_engine("xgboost", objective = "reg:squarederror", nthread = 1L) %>%
           fit(formula = formula, data = df_obs)
       },
       predict = function(fit, newdata, ...) {
@@ -245,7 +313,7 @@ get_model_registry <- function() {
         fit <- SuperLearner::SuperLearner(
           Y = Y,
           X = X,
-          cvControl = list(V = 10),
+          cvControl = list(V = 3),
           family = gaussian(),
           # Exclude SL.dbarts: setting_one_single_stage_logs shows ~5770.95s per scenario with BART in the stack.
           SL.library = c("SL.ranger", "SL.lm", "SL.xgboost"),

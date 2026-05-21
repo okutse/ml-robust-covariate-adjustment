@@ -88,13 +88,21 @@ download_and_unzip <- function(url, dest_dir) {
     dir.create(dest_dir, recursive = TRUE)
   }
   zip_path <- file.path(dest_dir, "zenodo_datasets.zip")
-  # Reuse a previously downloaded archive from the cache directory to avoid redundant downloads.
-  if (file.exists(zip_path)) {
+  # Reuse a previously downloaded archive only if it can actually be opened.
+  if (archive_is_openable(zip_path)) {
     safe_unzip_archive(zip_path, dest_dir)
   } else if (file.exists(url) && grepl("\\.zip$", url, ignore.case = TRUE)) {
     safe_unzip_archive(url, dest_dir)
   } else {
+    if (file.exists(zip_path)) {
+      cat("[data-source] Cached archive is invalid. Re-downloading Zenodo zip.\n")
+      unlink(zip_path)
+    }
     download_archive_file(url, zip_path)
+    if (!archive_is_openable(zip_path)) {
+      unlink(zip_path)
+      stop(paste("Downloaded archive is not a valid zip file:", zip_path))
+    }
     safe_unzip_archive(zip_path, dest_dir)
   }
   dest_dir
@@ -220,7 +228,15 @@ read_cached_replicate_diagnostics <- function(method_progress_dir) {
   if (length(files) == 0) {
     return(NULL)
   }
-  dplyr::bind_rows(lapply(files, read.csv, stringsAsFactors = FALSE))
+  rows <- lapply(files, function(f) read.csv(f, stringsAsFactors = FALSE))
+  rows <- rows[!vapply(rows, is.null, function(x) is.null(x))]
+  if (length(rows) == 0) return(NULL)
+  # Remove transient 'se_method' column if present in any cached files.
+  rows <- lapply(rows, function(df) {
+    if (is.data.frame(df) && "se_method" %in% names(df)) df$se_method <- NULL
+    df
+  })
+  dplyr::bind_rows(rows)
 }
 
 recompute_relative_efficiency <- function(results) {

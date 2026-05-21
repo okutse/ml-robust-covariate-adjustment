@@ -106,7 +106,7 @@ source(file.path("helpers", "data_source_helpers.R"))
 
 # Global defaults (override via environment variables as needed).
 CF_FOLDS <- as.integer(Sys.getenv("CF_FOLDS", CF_FOLDS))
-BOOTSTRAP_REPS_DEFAULT <- as.integer(Sys.getenv("BOOTSTRAP_REPS", 250))
+BOOTSTRAP_REPS_DEFAULT <- as.integer(Sys.getenv("BOOTSTRAP_REPS", 100))
 REPLICATES_DEFAULT <- as.integer(Sys.getenv("REPLICATES_TO_RUN", 500))
 BOOTSTRAP_SEED_DEFAULT <- as.integer(Sys.getenv("BOOTSTRAP_SEED", 20260417))
 TRUE_EFFECT_DEFAULT <- as.numeric(Sys.getenv("TRUE_EFFECT", 50))
@@ -158,6 +158,10 @@ write_replicate_cache <- function(method_dir, rep_row) {
   }
   if (!dir.exists(method_dir)) {
     dir.create(method_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  # Do not persist transient/internal-only columns to the per-replicate cache.
+  if ("se_method" %in% names(rep_row)) {
+    rep_row$se_method <- NULL
   }
   cache_file <- file.path(method_dir, sprintf("replicate_%s.csv", rep_row$replicate))
   write.csv(rep_row, cache_file, row.names = FALSE)
@@ -244,6 +248,11 @@ read_cached_replicate_diagnostics <- function(method_progress_dir) {
   if (length(rows) == 0) {
     return(NULL)
   }
+  # Remove transient 'se_method' column from any cached replicate before combining.
+  rows <- lapply(rows, function(df) {
+    if (is.data.frame(df) && "se_method" %in% names(df)) df$se_method <- NULL
+    df
+  })
   do.call(rbind, rows)
 }
 
@@ -516,24 +525,72 @@ run_all_models_for_dataset <- function(
       bc_ci_upper <- NA_real_
       bootstrap_time_sec <- NA_real_
       se_used <- NA_real_
+      se_method <- NA_character_
 
       if (isTRUE(procedure$use_eif_var)) {
         se_used <- res$eif_se
+        se_method <- "eif"
       } else {
-        boot_start <- Sys.time()
-        set.seed(bootstrap_seed + rep_id)
-        boot_estimates <- vapply(seq_len(bootstrap_reps), function(b) {
-          idx <- sample.int(nrow(df), size = nrow(df), replace = TRUE)
-          df_boot <- df[idx, , drop = FALSE]
-          estimate_from_df(df_boot)
-        }, numeric(1))
-        bootstrap_time_sec <- as.numeric(difftime(Sys.time(), boot_start, units = "secs"))
-        bootstrap_se <- stats::sd(boot_estimates)
-        bootstrap_bias <- mean(boot_estimates) - res$estimate
-        bc_estimate <- res$estimate - bootstrap_bias
-        bc_ci_lower <- bc_estimate - z_crit * bootstrap_se
-        bc_ci_upper <- bc_estimate + z_crit * bootstrap_se
-        se_used <- bootstrap_se
+        # If the global BART variance method requests posterior SE, use it instead of the bootstrap.
+        if (identical(model_name, "bart") && identical(BART_VARIANCE_METHOD, "posterior") && !is.null(model$posterior_se) && is.function(model$posterior_se)) {
+          post_start <- Sys.time()
+          # Choose a reasonable number of posterior samples relative to bootstrap reps.
+          n_samples <- max(200, min(1000, as.integer(bootstrap_reps * 5)))
+          post_res <- tryCatch(
+            model$posterior_se(df = df, outcome = "y", covariates = covariates, n_samples = n_samples),
+            error = function(e) {
+              cat("[posterior_se] failed for bart: ", conditionMessage(e), "\n")
+              NULL
+            }
+          )
+          if (!is.null(post_res) && !is.na(post_res$se)) {
+            bootstrap_time_sec <- if (!is.null(post_res$time_sec)) post_res$time_sec else as.numeric(difftime(Sys.time(), post_start, units = "secs"))
+            bootstrap_se <- as.numeric(post_res$se)
+            bootstrap_bias <- NA_real_
+            bc_estimate <- res$estimate
+            bc_ci_lower <- res$estimate - z_crit * bootstrap_se
+            bc_ci_upper <- res$estimate + z_crit * bootstrap_se
+            se_used <- bootstrap_se
+            se_method <- "posterior"
+          } else {
+            # Fallback to standard bootstrap if posterior-based SE unavailable.
+            boot_start <- Sys.time()
+            set.seed(bootstrap_seed + rep_id)
+            boot_estimates <- vapply(seq_len(bootstrap_reps), function(b) {
+              idx <- sample.int(nrow(df), size = nrow(df), replace = TRUE)
+              df_boot <- df[idx, , drop = FALSE]
+              estimate_from_df(df_boot)
+            }, numeric(1))
+            bootstrap_time_sec <- as.numeric(difftime(Sys.time(), boot_start, units = "secs"))
+            bootstrap_se <- stats::sd(boot_estimates)
+            bootstrap_bias <- mean(boot_estimates) - res$estimate
+            bc_estimate <- res$estimate - bootstrap_bias
+            bc_ci_lower <- bc_estimate - z_crit * bootstrap_se
+            bc_ci_upper <- bc_estimate + z_crit * bootstrap_se
+            se_method <- "bootstrap"
+            se_used <- bootstrap_se
+          }
+        } else {
+          boot_start <- Sys.time()
+          set.seed(bootstrap_seed + rep_id)
+          boot_estimates <- vapply(seq_len(bootstrap_reps), function(b) {
+            idx <- sample.int(nrow(df), size = nrow(df), replace = TRUE)
+            df_boot <- df[idx, , drop = FALSE]
+            estimate_from_df(df_boot)
+          }, numeric(1))
+          bootstrap_time_sec <- as.numeric(difftime(Sys.time(), boot_start, units = "secs"))
+          bootstrap_se <- stats::sd(boot_estimates)
+          bootstrap_bias <- mean(boot_estimates) - res$estimate
+          bc_estimate <- res$estimate - bootstrap_bias
+          bc_ci_lower <- bc_estimate - z_crit * bootstrap_se
+          bc_ci_upper <- bc_estimate + z_crit * bootstrap_se
+          se_method <- "bootstrap"
+          se_used <- bootstrap_se
+        }
+      }
+
+      if (identical(model_name, "bart")) {
+        log_progress_line(log_file, sprintf("Using %s for BART on replicate %s", se_method, rep_id))
       }
 
       ci_lower <- res$estimate - z_crit * se_used
@@ -567,6 +624,7 @@ run_all_models_for_dataset <- function(
         reject_h0_effect = reject_h0_effect,
         reject_h0_null = reject_h0_null,
         bootstrap_time_sec = bootstrap_time_sec,
+        se_method = se_method,
         replicate_time_sec = rep_time_sec,
         stringsAsFactors = FALSE
       )

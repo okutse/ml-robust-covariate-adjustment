@@ -2,14 +2,79 @@
 
 # Global CF settings keep fold count and bootstrap size consistent across methods.
 CF_FOLDS <- 2
-BOOTSTRAP_REPS_DEFAULT <- 250
+BOOTSTRAP_REPS_DEFAULT <- 100
 # Default number of Monte Carlo replicates to process unless overridden by the caller.
 REPLICATES_DEFAULT <- 500
+
+# Control the BART variance estimator globally across scripts.
+# Supported values: "bootstrap" (default) or "posterior".
+BART_VARIANCE_METHOD <- tolower(Sys.getenv("BART_VARIANCE_METHOD", "bootstrap"))
+if (!BART_VARIANCE_METHOD %in% c("bootstrap", "posterior")) {
+  BART_VARIANCE_METHOD <- "bootstrap"
+}
 
 # Ensure the pipe operator is available when helpers are sourced directly.
 if (!exists("%>%")) {
   `%>%` <- magrittr::`%>%`
 }
+
+.reduce_bart_prediction_draws <- function(pred_raw, n_obs) {
+  if (is.null(pred_raw)) {
+    return(NULL)
+  }
+  if (is.null(dim(pred_raw))) {
+    pred_raw <- matrix(as.numeric(pred_raw), nrow = 1)
+  }
+  if (nrow(pred_raw) == n_obs) {
+    return(t(pred_raw))
+  }
+  if (ncol(pred_raw) == n_obs) {
+    return(pred_raw)
+  }
+  matrix(as.numeric(pred_raw), nrow = 1)
+}
+
+bart_posterior_se_cf <- function(df, n_samples = 500, outcome = "y") {
+  if (!requireNamespace("dbarts", quietly = TRUE)) {
+    stop("dbarts is required for BART posterior SE computation.")
+  }
+  train <- as.data.frame(df)
+  x_names <- c("A", "x1", "x2", "x3", "x4")
+  X_train <- train[, x_names, drop = FALSE]
+  X_train[] <- lapply(X_train, as.numeric)
+  y_train <- as.numeric(train[[outcome]])
+
+  start_time <- Sys.time()
+  bart_fit <- dbarts::bart(
+    x.train = as.matrix(X_train),
+    y.train = y_train,
+    ndpost = n_samples,
+    nskip = max(100, floor(n_samples / 10)),
+    keeptrees = TRUE,
+    verbose = FALSE
+  )
+
+  X1 <- X_train
+  X1$A <- 1
+  X0 <- X_train
+  X0$A <- 0
+
+  pred1_raw <- tryCatch(predict(bart_fit, newdata = as.matrix(X1)), error = function(e) NULL)
+  pred0_raw <- tryCatch(predict(bart_fit, newdata = as.matrix(X0)), error = function(e) NULL)
+  samples1 <- .reduce_bart_prediction_draws(pred1_raw, nrow(X_train))
+  samples0 <- .reduce_bart_prediction_draws(pred0_raw, nrow(X_train))
+  time_sec <- as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+
+  if (is.null(samples1) || is.null(samples0) || nrow(samples1) != nrow(samples0)) {
+    return(list(se = NA_real_, mean = NA_real_, time_sec = time_sec))
+  }
+
+  tau_samples <- rowMeans(samples1 - samples0)
+  list(se = stats::sd(tau_samples), mean = mean(tau_samples), time_sec = time_sec)
+}
+
+# Keep threaded learners from multiplying the server allocation.
+Sys.setenv(OMP_NUM_THREADS = "1", MKL_NUM_THREADS = "1")
 
 ensure_dir <- function(path) {
   if (!is.null(path) && nzchar(path) && !dir.exists(path)) {
@@ -32,6 +97,10 @@ write_replicate_cache <- function(method_dir, rep_row) {
     return(invisible(NULL))
   }
   ensure_dir(method_dir)
+  # Do not persist transient/internal-only columns to the per-replicate cache.
+  if ("se_method" %in% names(rep_row)) {
+    rep_row$se_method <- NULL
+  }
   cache_file <- file.path(method_dir, sprintf("replicate_%s.csv", rep_row$replicate))
   write.csv(rep_row, cache_file, row.names = FALSE)
 
@@ -155,7 +224,7 @@ rf_one_cf <- function(df) {
       # Use off-the-shelf random forest defaults (no tuning).
       parsnip::rand_forest() %>%
         parsnip::set_mode("regression") %>%
-        parsnip::set_engine("ranger") %>%
+        parsnip::set_engine("ranger", num.threads = 1L) %>%
         parsnip::fit(y ~ A + x1 + x2 + x3 + x4, data = train)
     },
     pred_fun = function(fit_obj, new_data) as.numeric(predict(fit_obj, new_data)$.pred),
@@ -189,7 +258,7 @@ super_fit_cf <- function(train, cl = NULL) {
       family = gaussian(),
       SL.library = c("SL.ranger", "SL.lm", "SL.xgboost"),
       method = "method.NNLS",
-      cvControl = list(V = 10)
+      cvControl = list(V = 3)
     )
   } else {
     fit <- SuperLearner::snowSuperLearner(
@@ -198,7 +267,7 @@ super_fit_cf <- function(train, cl = NULL) {
       family = gaussian(),
       SL.library = c("SL.ranger", "SL.lm", "SL.xgboost"),
       method = "method.NNLS",
-      cvControl = list(V = 10),
+      cvControl = list(V = 3),
       cluster = cl
     )
   }
@@ -229,7 +298,7 @@ xgboost_one_cf <- function(df, cl = NULL) {
     fit_fun = function(train) {
       # Use off-the-shelf gradient boosting defaults (no tuning).
       parsnip::boost_tree(mode = "regression") %>%
-        parsnip::set_engine("xgboost", objective = "reg:squarederror") %>%
+        parsnip::set_engine("xgboost", objective = "reg:squarederror", nthread = 1L) %>%
         parsnip::fit(y ~ A + x1 + x2 + x3 + x4, data = train)
     },
     pred_fun = function(fit_obj, new_data) as.numeric(predict(fit_obj, new_data)$.pred),
@@ -257,7 +326,11 @@ get_single_stage_cf_registry <- function() {
     lm = list(name = "lm", fit = function(df, ...) lm_one_cf(df)),
     lm_interact = list(name = "lm_interact", fit = function(df, ...) lm_interact_one_cf(df)),
     rf = list(name = "rf", fit = function(df, ...) rf_one_cf(df)),
-    bart = list(name = "bart", fit = function(df, ...) bart_one_cf(df)),
+    bart = list(
+      name = "bart",
+      fit = function(df, ...) bart_one_cf(df),
+      posterior_se = function(df, n_samples = 500, ...) bart_posterior_se_cf(df, n_samples = n_samples)
+    ),
     super = list(name = "super", fit = function(df, ...) super_one_cf(df, ...)),
     xgboost = list(name = "xgboost", fit = function(df, ...) xgboost_one_cf(df, ...)),
     correct_model = list(name = "correct_model", fit = function(df, ...) correct_model_cf(df))
@@ -465,6 +538,34 @@ run_single_stage_cf <- function(
       # Optional power diagnostic for a user-specified null effect.
       reject_h0_null <- as.integer(ci_lower > null_effect || ci_upper < null_effect)
 
+      se_method <- "bootstrap"
+
+      if (identical(method$name, "bart") && identical(BART_VARIANCE_METHOD, "posterior") && !is.null(method$posterior_se) && is.function(method$posterior_se)) {
+        post_samples <- max(200, min(1000, as.integer(bootstrap_reps * 5)))
+        post_res <- tryCatch(
+          method$posterior_se(df = df, n_samples = post_samples),
+          error = function(e) {
+            log_progress_line(log_file, sprintf("[posterior_se] failed for bart: %s", conditionMessage(e)))
+            NULL
+          }
+        )
+        if (!is.null(post_res) && !is.na(post_res$se)) {
+          bootstrap_se <- as.numeric(post_res$se)
+          bootstrap_time_sec <- if (!is.null(post_res$time_sec)) post_res$time_sec else NA_real_
+          bootstrap_bias <- NA_real_
+          bc_estimate <- point_estimate
+          ci_lower <- point_estimate - z_crit * bootstrap_se
+          ci_upper <- point_estimate + z_crit * bootstrap_se
+          bc_ci_lower <- ci_lower
+          bc_ci_upper <- ci_upper
+          se_method <- "posterior"
+        }
+      }
+
+      if (identical(method$name, "bart")) {
+        log_progress_line(log_file, sprintf("Using %s for BART replicate %s", se_method, rep_id))
+      }
+
       total_rep_time_sec <- as.numeric(difftime(Sys.time(), rep_time_start, units = "secs"))
 
       rep_row <- data.frame(
@@ -484,6 +585,7 @@ run_single_stage_cf <- function(
         reject_h0_effect = reject_h0_effect,
         reject_h0_null = reject_h0_null,
         bootstrap_time_sec = bootstrap_time_sec,
+        se_method = se_method,
         replicate_time_sec = total_rep_time_sec,
         stringsAsFactors = FALSE
       )
