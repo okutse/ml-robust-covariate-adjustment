@@ -1,3 +1,23 @@
+# Ignore intermediate simulation outputs; keep only aggregated results for reproducibility
+
+# Missing-outcomes: ignore all intermediate results but allow aggregated CSVs
+simulations/missing_outcomes/miss_intermediate_results/**
+!simulations/missing_outcomes/miss_intermediate_results/**/*_aggregated.csv
+
+# Complete-data: ignore per-replicate and intermediate files but keep final results
+simulations/complete_data/complete_data_results/**
+!simulations/complete_data/complete_data_results/**/*_results.csv
+!simulations/complete_data/complete_data_results/**/*_replicate_diagnostics.csv
+!simulations/complete_data/complete_data_results/**/*_aggregated.csv
+
+# Generic patterns to ignore per-replicate caches and checkpoints
+**/replicate_*.csv
+**/replicate_*_checkpoint.csv
+**/replicate_checkpoint.csv
+
+# Archives and large downloads (keep only if you intentionally add them)
+simulations/**/archives/**
+
 # History files
 .Rhistory
 .Rapp.history

@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=11
 #SBATCH --mem=115G
-#SBATCH --time=48:00:00
+#SBATCH --time=72:00:00 
 #SBATCH --output=logs/missing_outcomes/single_stage_drml_bc_%A.out
 #SBATCH --error=logs/missing_outcomes/single_stage_drml_bc_%A.err
 #SBATCH --mail-type=END,FAIL
@@ -13,10 +13,27 @@
 set -euo pipefail
 module load r/4.5.1
 
-# Run the job from the repository root so renv and project-relative paths resolve correctly.
-# Run the job from the Slurm submission directory so renv and project-relative paths resolve correctly.
-project_root="${SLURM_SUBMIT_DIR:-$PWD}"
+# Resolve repository root robustly across path aliases (/users vs /oscar/home).
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_root_guess="$(cd "$script_dir/../../../.." && pwd)"
+submit_root="${SLURM_SUBMIT_DIR:-$PWD}"
+
+project_root=""
+for candidate in "$script_root_guess" "$submit_root"; do
+	if [[ -f "$candidate/renv/activate.R" && -f "$candidate/simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R" ]]; then
+		project_root="$candidate"
+		break
+	fi
+done
+
+if [[ -z "$project_root" ]]; then
+	echo "Unable to locate project root with renv/activate.R and run_missing_single_stage_drml_bc.R" >&2
+	echo "Checked: $script_root_guess and $submit_root" >&2
+	exit 1
+fi
+
 cd "$project_root"
+echo "Using project_root=$project_root"
 
 # Activate renv first, then restore the project library before any analysis code runs.
 Rscript -e 'source("renv/activate.R"); renv::restore(prompt = FALSE)'

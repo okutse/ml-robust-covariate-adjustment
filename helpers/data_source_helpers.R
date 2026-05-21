@@ -113,6 +113,22 @@ resolve_zenodo_download_url <- function(reference, preferred_file = NULL) {
   stop("Zenodo record metadata did not expose a downloadable file link.")
 }
 
+archive_is_openable <- function(zip_path) {
+  if (is.null(zip_path) || !nzchar(zip_path) || !file.exists(zip_path)) {
+    return(FALSE)
+  }
+
+  normalized_path <- tryCatch(
+    normalizePath(zip_path, winslash = "/", mustWork = TRUE),
+    error = function(e) zip_path
+  )
+
+  tryCatch({
+    archive_listing <- utils::unzip(normalized_path, list = TRUE)
+    is.data.frame(archive_listing) && nrow(archive_listing) > 0
+  }, error = function(e) FALSE)
+}
+
 safe_unzip_archive <- function(zip_path, dest_dir) {
   if (!file.exists(zip_path)) {
     stop(paste("Archive file not found:", zip_path))
@@ -121,6 +137,7 @@ safe_unzip_archive <- function(zip_path, dest_dir) {
     dir.create(dest_dir, recursive = TRUE, showWarnings = FALSE)
   }
 
+  zip_path <- tryCatch(normalizePath(zip_path, winslash = "/", mustWork = TRUE), error = function(e) zip_path)
   archive_listing <- utils::unzip(zip_path, list = TRUE)
   archive_names <- if ("Name" %in% names(archive_listing)) archive_listing$Name else character(0)
   if (length(archive_names) == 0) {
