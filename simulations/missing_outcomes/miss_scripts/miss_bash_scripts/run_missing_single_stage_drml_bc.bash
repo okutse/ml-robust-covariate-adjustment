@@ -5,8 +5,6 @@
 #SBATCH --cpus-per-task=11
 #SBATCH --mem=115G
 #SBATCH --time=72:00:00 
-#SBATCH --output=logs/missing_outcomes/single_stage_drml_bc_%A.out
-#SBATCH --error=logs/missing_outcomes/single_stage_drml_bc_%A.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=amos_okutse@brown.edu
 
@@ -40,7 +38,13 @@ Rscript -e 'source("renv/activate.R"); renv::restore(prompt = FALSE)'
 
 # Example:
 # sbatch simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_single_stage_drml_bc.bash
-# SETTING=setting_one DATA_SOURCE=local RESET_CHECKPOINT=true \
-# sbatch --export=SETTING,DATA_SOURCE,RESET_CHECKPOINT simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_single_stage_drml_bc.bash
+# setting=setting_four
+# mkdir -p "$repo/logs/missing_outcomes/$setting"
+# sbatch --chdir="$repo" \
+#   --job-name="miss_${setting}_single_stage_drml_bc" \
+#   --output="$repo/logs/missing_outcomes/$setting/single_stage_drml_bc_%j.out" \
+#   --error="$repo/logs/missing_outcomes/$setting/single_stage_drml_bc_%j.err" \
+#   --export=SETTING=$setting,DATA_SOURCE=archive,ARCHIVE_DATASETS_DIR=$repo/simulations/missing_outcomes/archives/zenodo/zenodo_datasets.zip \
+#   simulations/missing_outcomes/miss_scripts/miss_bash_scripts/run_missing_single_stage_drml_bc.bash
 
 Rscript simulations/missing_outcomes/miss_scripts/run_missing_single_stage_drml_bc.R
