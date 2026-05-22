@@ -820,6 +820,33 @@ resolve_missing_input_root <- function() {
   input_root <- file.path("simulations", "missing_outcomes", "miss_datasets")
   local_available <- local_dataset_available(input_root, "^setting_.*\\.RData$")
 
+  try_archive_dir <- function(path) {
+    if (!nzchar(path) || !dir.exists(path)) {
+      return(NULL)
+    }
+
+    tryCatch({
+      if (local_dataset_available(path, "^setting_.*\\.RData$")) {
+        path
+      } else {
+        find_archive_root(
+          base_dir = path,
+          file_pattern = "^setting_.*\\.RData$",
+          parent_levels = 1
+        )
+      }
+    }, error = function(e) {
+      cat(
+        "[data-source] Archive directory could not be used:",
+        path,
+        "- falling back to Zenodo DOI. Reason:",
+        conditionMessage(e),
+        "\n"
+      )
+      NULL
+    })
+  }
+
   if (data_source == "regenerate") {
     return(input_root)
   }
@@ -832,8 +859,9 @@ resolve_missing_input_root <- function() {
     return(input_root)
   }
 
-  if (nzchar(archive_dir) && dir.exists(archive_dir)) {
-    return(archive_dir)
+  archive_root <- try_archive_dir(archive_dir)
+  if (!is.null(archive_root)) {
+    return(archive_root)
   }
 
   archive_reference <- if (nzchar(zenodo_url)) zenodo_url else zenodo_doi
