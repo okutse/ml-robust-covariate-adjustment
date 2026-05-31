@@ -481,7 +481,15 @@ run_two_stage_cf <- function(
     metrics <- foreach::foreach(
       i = seq_along(datasets),
       .combine = rbind,
-      .packages = c("parsnip", "ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr", "rsample")
+      .packages = c("parsnip", "ranger", "dbarts", "SuperLearner", "xgboost", "magrittr", "purrr", "rsample"),
+      .export = c(
+        "log_progress_line",
+        "write_replicate_cache",
+        "ensure_dir",
+        "consolidate_replicate_checkpoints",
+        "extract_two_stage_metrics_cf",
+        "BART_VARIANCE_METHOD"
+      )
     ) %op% {
       rep_id <- replicate_ids[i]
       # Emit per-replicate progress only in sequential mode to keep logs ordered and readable.

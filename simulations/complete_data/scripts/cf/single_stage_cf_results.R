@@ -8,7 +8,7 @@ required_packages <- c(
 ) 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
-  renv_lock <- file.path(getwd(), "renv.lock")
+  renv_lock <- project_path("renv.lock")
   if (requireNamespace("renv", quietly = TRUE) && file.exists(renv_lock)) {
     renv::install(missing_packages, prompt = FALSE)
   } else {
@@ -20,9 +20,25 @@ invisible(lapply(required_packages, function(pkg) {
   suppressPackageStartupMessages(library(pkg, character.only = TRUE))
 }))
 
+get_script_path <- function() {
+  cmd_args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", cmd_args, value = TRUE)
+  if (length(file_arg) > 0) {
+    return(normalizePath(sub("^--file=", "", file_arg[[1]]), winslash = "/", mustWork = TRUE))
+  }
+  stop("Unable to determine script path for project-root resolution.")
+}
+
+get_project_root <- function(script_path = get_script_path()) {
+  normalizePath(file.path(dirname(script_path), "..", "..", "..", ".."), winslash = "/", mustWork = TRUE)
+}
+
+project_root <- get_project_root()
+project_path <- function(...) file.path(project_root, ...)
+
 # source the helper functions for all methods implemented.
-source("simulations/complete_data/scripts/cf/cf_single_stage_helpers.R")
-source(file.path("helpers", "data_source_helpers.R"))
+source(project_path("simulations", "complete_data", "scripts", "cf", "cf_single_stage_helpers.R"))
+source(project_path("helpers", "data_source_helpers.R"))
 
 # Cross-fitted single-stage simulation (one file per scenario)
 procedure_name <- "single_stage_cf"
@@ -41,12 +57,12 @@ load_data <- function(path) {
 }
 
 # Inputs
-input_dir <- "simulations/complete_data/datasets"
+input_dir <- project_path("simulations", "complete_data", "datasets")
 local_datasets_dir <- input_dir
-output_dir <- file.path("simulations/complete_data/complete_data_results", procedure_name)
+output_dir <- project_path("simulations", "complete_data", "complete_data_results", procedure_name)
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
-log_dir <- file.path("logs", "complete_data", procedure_name)
+log_dir <- project_path("logs", "complete_data", procedure_name)
 dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
 log_file <- file.path(log_dir, sprintf("%s_%s.log", procedure_name, format(Sys.time(), "%Y%m%d_%H%M%S")))
 log_file <- normalizePath(log_file, mustWork = FALSE)
@@ -116,7 +132,7 @@ find_archive_dir <- function(base_dir) {
 if (data_source == "regenerate") {
   input_dir <- local_datasets_dir
   # Regenerating complete-data scenarios keeps the same seed-controlled generator behavior.
-  source(file.path("simulations", "complete_data", "scripts", "generate_complete_data.R"))
+  source(project_path("simulations", "complete_data", "scripts", "generate_complete_data.R"))
 } else if (data_source %in% c("archive", "local")) {
   local_available <- local_dataset_available(local_datasets_dir, "^complete_n\\d+_r2_\\d+p\\d+\\.RData$")
   if (data_source == "local" && local_available) {
@@ -139,7 +155,7 @@ if (data_source == "regenerate") {
     } else if (dir.exists(archive_source)) {
       input_dir <- find_archive_dir(archive_source)
     } else {
-      zenodo_cache <- file.path("simulations", "complete_data", "archives", "zenodo")
+      zenodo_cache <- project_path("simulations", "complete_data", "archives", "zenodo")
       download_and_unzip(archive_source, zenodo_cache)
       input_dir <- find_archive_dir(zenodo_cache)
     }
