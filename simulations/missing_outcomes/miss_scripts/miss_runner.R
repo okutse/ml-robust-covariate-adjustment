@@ -107,7 +107,7 @@ source(file.path("helpers", "data_source_helpers.R"))
 # Global defaults (override via environment variables as needed).
 CF_FOLDS <- as.integer(Sys.getenv("CF_FOLDS", CF_FOLDS))
 BOOTSTRAP_REPS_DEFAULT <- as.integer(Sys.getenv("BOOTSTRAP_REPS", 100))
-REPLICATES_DEFAULT <- as.integer(Sys.getenv("REPLICATES_TO_RUN", 500))
+REPLICATES_DEFAULT <- as.integer(Sys.getenv("REPLICATES_TO_RUN", 300))
 BOOTSTRAP_SEED_DEFAULT <- as.integer(Sys.getenv("BOOTSTRAP_SEED", 20260417))
 TRUE_EFFECT_DEFAULT <- as.numeric(Sys.getenv("TRUE_EFFECT", 50))
 NULL_EFFECT_DEFAULT <- as.numeric(Sys.getenv("NULL_EFFECT", 0))
@@ -723,8 +723,18 @@ run_missing_outcomes <- function(
   model_registry <- get_model_registry()
 
   input_files <- list.files(input_root, pattern = "\\.RData$", full.names = TRUE, recursive = TRUE)
+  include_n500 <- tolower(Sys.getenv("INCLUDE_SETTING_500", "false")) %in% c("1", "true", "yes", "y")
+  if (!include_n500) {
+    input_files <- input_files[!grepl("_n500_", basename(input_files))]
+  }
   if (length(input_files) == 0) {
-    stop(paste("No scenario files found in", input_root))
+    if (include_n500) {
+      stop(paste("No scenario files found in", input_root))
+    }
+    stop(paste(
+      "No scenario files found in", input_root,
+      "after excluding n500 inputs. Set INCLUDE_SETTING_500=true to process them."
+    ))
   }
 
   all_results <- do.call(rbind, lapply(input_files, function(file_path) {

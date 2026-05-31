@@ -158,8 +158,15 @@ if (data_source == "regenerate") {
 }
 
 all_files <- list.files(input_dir, pattern = "^complete_.*\\.RData$", full.names = TRUE)
+include_n500 <- tolower(Sys.getenv("INCLUDE_SETTING_500", "false")) %in% c("1", "true", "yes", "y")
+if (!include_n500) {
+  all_files <- all_files[!grepl("_n500_", basename(all_files))]
+}
 if (length(all_files) == 0) {
-  stop("No input files found in complete_data/datasets")
+  if (include_n500) {
+    stop("No input files found in complete_data/datasets")
+  }
+  stop("No input files found in complete_data/datasets after excluding n500 scenarios. Set INCLUDE_SETTING_500=true to process them.")
 }
 
 if (file.exists(manifest_file)) {

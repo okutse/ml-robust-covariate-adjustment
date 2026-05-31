@@ -4,7 +4,7 @@
 CF_FOLDS <- 2
 BOOTSTRAP_REPS_DEFAULT <- 100
 # Default number of Monte Carlo replicates to process unless overridden by the caller.
-REPLICATES_DEFAULT <- 500
+REPLICATES_DEFAULT <- 300
 
 # Control the BART variance estimator globally across scripts.
 # Supported values: "bootstrap" (default) or "posterior".
