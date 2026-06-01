@@ -152,6 +152,17 @@ safe_read_csv <- function(path, ...) {
   out
 }
 
+should_include_n500 <- function() {
+  tolower(Sys.getenv("INCLUDE_SETTING_500", "false")) %in% c("1", "true", "yes", "y")
+}
+
+filter_missing_input_files <- function(input_files, include_n500 = should_include_n500()) {
+  if (include_n500) {
+    return(input_files)
+  }
+  input_files[!grepl("_n500_", basename(input_files))]
+}
+
 write_replicate_cache <- function(method_dir, rep_row) {
   if (is.null(method_dir) || !nzchar(method_dir)) {
     return(invisible(NULL))
@@ -723,10 +734,8 @@ run_missing_outcomes <- function(
   model_registry <- get_model_registry()
 
   input_files <- list.files(input_root, pattern = "\\.RData$", full.names = TRUE, recursive = TRUE)
-  include_n500 <- tolower(Sys.getenv("INCLUDE_SETTING_500", "false")) %in% c("1", "true", "yes", "y")
-  if (!include_n500) {
-    input_files <- input_files[!grepl("_n500_", basename(input_files))]
-  }
+  include_n500 <- should_include_n500()
+  input_files <- filter_missing_input_files(input_files, include_n500 = include_n500)
   if (length(input_files) == 0) {
     if (include_n500) {
       stop(paste("No scenario files found in", input_root))
@@ -943,6 +952,7 @@ run_procedure_for_setting <- function(
   on.exit(sink(), add = TRUE)
 
   input_files <- list.files(setting_dir, pattern = "\\.RData$", full.names = TRUE)
+  input_files <- filter_missing_input_files(input_files)
   if (length(input_files) == 0) {
     stop(paste("No scenario files found in", setting_dir))
   }
