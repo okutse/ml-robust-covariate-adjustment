@@ -122,3 +122,6 @@ simulations/missing_outcomes/miss_scripts/colab_run/
 
 # ignore archive files
 simulations/missing_outcomes/archives/
+
+#ignore slurm output files
+slurm-*.out
