@@ -119,3 +119,6 @@ simulations/missing_outcomes/miss_scripts/reconcile_missing_outputs.R
 
 # ignore archive files
 simulations/missing_outcomes/archives/
+
+#ignore slurm output files
+slurm-*.out

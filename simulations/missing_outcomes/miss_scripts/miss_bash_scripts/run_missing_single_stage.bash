@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=11
-#SBATCH --mem=115G
+#SBATCH --mem=80G
 #SBATCH --time=72:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=amos_okutse@brown.edu
