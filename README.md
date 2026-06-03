@@ -416,6 +416,22 @@ RESET_CHECKPOINT=true Rscript simulations/complete_data/scripts/cf/single_stage_
 
 Missing-outcome analyses apply doubly-robust and targeted learning methods to handle missing outcomes under different missingness mechanisms across four settings.
 
+### Positivity Regularization
+
+The missing-outcome DR and TMLE estimators use a data-adaptive positivity regularization rule rather than a fixed arbitrary cap. Following Gruber et al. (2022) and related overlap/truncation work, the inverse-probability weight upper bound is set to
+
+$$
+w_{\max}(n) = \frac{\sqrt{n}\,\log(n)}{5},
+$$
+
+and the corresponding propensity-score lower bound is the reciprocal,
+
+$$
+\epsilon_n = \frac{1}{w_{\max}(n)} = \frac{5}{\sqrt{n}\,\log(n)}.
+$$
+
+In this implementation, $n$ is the analysis sample size used by the procedure, so the truncation rule is deterministic, reproducible, and scales with the amount of information in the data. The same bound is used for the cross-fitted AIPW weights and the TMLE clever covariates, with fold-level numerators retained for stabilization. The legacy `IPW_CAP` and `PS_TRUNCATION` environment variables remain available as manual overrides for sensitivity analyses, but the default behavior is now the sample-size-based rule.
+
 ### Analyses Available
 
 | Procedure | Setting | Model Specs | Runner Script |

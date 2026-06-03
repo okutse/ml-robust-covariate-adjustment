@@ -35,7 +35,7 @@ if (file.exists(renv_activate)) {
 
 source(file.path(project_root, "simulations", "missing_outcomes", "miss_scripts", "miss_runner.R"))
 
-setting_name <- Sys.getenv("SETTING", "setting_three") # can be changed via environment variable, e.g. when running on Slurm or locally with different settings
+setting_name <- Sys.getenv("SETTING", "setting_one") # can be changed via environment variable, e.g. when running on Slurm or locally with different settings
 model_specs <- c("m1", "m2")
 
 run_procedure_for_setting(

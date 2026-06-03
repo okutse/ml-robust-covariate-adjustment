@@ -22,8 +22,72 @@ if (!exists("%>%")) {
   `%>%` <- magrittr::`%>%`
 }
 
-bound_prob <- function(x, eps = 1e-6) {
+get_positive_env_numeric <- function(name, default, min_value = 0, max_value = Inf) {
+  value <- suppressWarnings(as.numeric(Sys.getenv(name, NA_character_)))
+  if (!is.finite(value) || value <= min_value || value >= max_value) {
+    return(default)
+  }
+  value
+}
+
+adaptive_weight_cap <- function(n) {
+  n <- max(2, as.numeric(n))
+  sqrt(n) * log(n) / 5
+}
+
+adaptive_probability_floor <- function(n) {
+  1 / adaptive_weight_cap(n)
+}
+
+probability_floor <- function(n = NULL) {
+  env_value <- suppressWarnings(as.numeric(Sys.getenv("PS_TRUNCATION", NA_character_)))
+  if (is.finite(env_value) && env_value > 0 && env_value < 0.5) {
+    return(env_value)
+  }
+  if (!is.null(n)) {
+    return(adaptive_probability_floor(n))
+  }
+  get_positive_env_numeric("PS_TRUNCATION", 0.01, min_value = 0, max_value = 0.5)
+}
+
+inverse_weight_cap <- function(n = NULL) {
+  env_value <- suppressWarnings(as.numeric(Sys.getenv("IPW_CAP", NA_character_)))
+  if (is.finite(env_value) && env_value > 0) {
+    return(env_value)
+  }
+  if (!is.null(n)) {
+    return(adaptive_weight_cap(n))
+  }
+  get_positive_env_numeric("IPW_CAP", 50, min_value = 0, max_value = Inf)
+}
+
+bound_prob <- function(x, eps = probability_floor(length(x))) {
   pmin(pmax(x, eps), 1 - eps)
+}
+
+dr_inverse_weights <- function(df, e_hat, pi1, pi0, cap = inverse_weight_cap(nrow(df))) {
+  w1 <- df$A / (e_hat * pi1)
+  w0 <- (1 - df$A) / ((1 - e_hat) * pi0)
+
+  w1 <- pmin(w1, cap)
+  w0 <- pmin(w0, cap)
+
+  list(w1 = w1, w0 = w0)
+}
+
+fold_stabilizers <- function(train_dat, eps = probability_floor(nrow(train_dat))) {
+  pA1 <- bound_prob(mean(train_dat$A == 1), eps = eps)
+  pA0 <- 1 - pA1
+
+  pR1A1 <- if (any(train_dat$A == 1)) mean(train_dat$R[train_dat$A == 1] == 1) else mean(train_dat$R == 1)
+  pR1A0 <- if (any(train_dat$A == 0)) mean(train_dat$R[train_dat$A == 0] == 1) else mean(train_dat$R == 1)
+
+  list(
+    pA1 = bound_prob(pA1, eps = eps),
+    pA0 = bound_prob(pA0, eps = eps),
+    pR1A1 = bound_prob(pR1A1, eps = eps),
+    pR1A0 = bound_prob(pR1A0, eps = eps)
+  )
 }
 
 crossfit_outcome_predictions <- function(df, outcome, covariates, model, folds = CF_FOLDS, ...) {
@@ -66,6 +130,7 @@ crossfit_dr_nuisance <- function(df, outcome, covariates, model, folds = CF_FOLD
   df_cf <- as.data.frame(df)
   df_cf$.row_id <- seq_len(nrow(df_cf))
   x_covars <- setdiff(covariates, "A")
+  eps <- probability_floor(nrow(df_cf))
 
   fold_obj <- rsample::vfold_cv(df_cf, v = folds)
   mu0 <- rep(NA_real_, nrow(df_cf))
@@ -131,9 +196,9 @@ crossfit_dr_nuisance <- function(df, outcome, covariates, model, folds = CF_FOLD
     }
   }
 
-  e_hat <- bound_prob(e_hat)
-  pi1 <- bound_prob(pi1)
-  pi0 <- bound_prob(pi0)
+  e_hat <- bound_prob(e_hat, eps = eps)
+  pi1 <- bound_prob(pi1, eps = eps)
+  pi0 <- bound_prob(pi0, eps = eps)
 
   if (anyNA(mu0) || anyNA(mu1) || anyNA(e_hat) || anyNA(pi1) || anyNA(pi0)) {
     stop("Cross-fitting failed: some out-of-fold nuisance predictions are missing.")
@@ -149,10 +214,10 @@ crossfit_dr_nuisance <- function(df, outcome, covariates, model, folds = CF_FOLD
   )
 }
 
-compute_dr_eif <- function(df, outcome, mu0, mu1, e_hat, pi1, pi0, tau_hat) {
+compute_dr_eif <- function(df, outcome, mu0, mu1, w1, w0, tau_hat) {
   y_obs <- ifelse(df$R == 1, df[[outcome]], 0)
-  term1 <- (df$R / pi1) * (df$A) * (y_obs - mu1) / e_hat
-  term0 <- (df$R / pi0) * (1 - df$A) * (y_obs - mu0) / (1 - e_hat)
+  term1 <- df$R * w1 * (y_obs - mu1)
+  term0 <- df$R * w0 * (y_obs - mu0)
   mu1 - mu0 - tau_hat + term1 - term0
 }
 
@@ -460,11 +525,14 @@ get_procedure_registry <- function() {
           ...
         )
 
-        mA <- ifelse(df$A == 1, nuis$mu1, nuis$mu0)
         y_obs <- ifelse(df$R == 1, df[[outcome]], 0)
-        aug <- df$R / ifelse(df$A == 1, nuis$pi1, nuis$pi0) *
-          (df$A - nuis$e_hat) / (nuis$e_hat * (1 - nuis$e_hat)) *
-          (y_obs - mA)
+        weights <- dr_inverse_weights(
+          df = df,
+          e_hat = nuis$e_hat,
+          pi1 = 1,
+          pi0 = 1
+        )
+        aug <- df$R * (weights$w1 * (y_obs - nuis$mu1) - weights$w0 * (y_obs - nuis$mu0))
         estimate <- mean(nuis$mu1 - nuis$mu0 + aug)
 
         eif <- compute_dr_eif(
@@ -472,9 +540,8 @@ get_procedure_registry <- function() {
           outcome = outcome,
           mu0 = nuis$mu0,
           mu1 = nuis$mu1,
-          e_hat = nuis$e_hat,
-          pi1 = nuis$pi1,
-          pi0 = nuis$pi0,
+          w1 = weights$w1,
+          w0 = weights$w0,
           tau_hat = estimate
         )
         eif_var <- stats::var(eif)
@@ -524,11 +591,14 @@ get_procedure_registry <- function() {
           ...
         )
 
-        mA <- ifelse(df$A == 1, nuis$mu1, nuis$mu0)
         y_obs <- ifelse(df$R == 1, df[[outcome]], 0)
-        aug <- df$R / ifelse(df$A == 1, nuis$pi1, nuis$pi0) *
-          (df$A - nuis$e_hat) / (nuis$e_hat * (1 - nuis$e_hat)) *
-          (y_obs - mA)
+        weights <- dr_inverse_weights(
+          df = df,
+          e_hat = nuis$e_hat,
+          pi1 = nuis$pi1,
+          pi0 = nuis$pi0
+        )
+        aug <- df$R * (weights$w1 * (y_obs - nuis$mu1) - weights$w0 * (y_obs - nuis$mu0))
         estimate <- mean(nuis$mu1 - nuis$mu0 + aug)
 
         eif <- compute_dr_eif(
@@ -536,9 +606,8 @@ get_procedure_registry <- function() {
           outcome = outcome,
           mu0 = nuis$mu0,
           mu1 = nuis$mu1,
-          e_hat = nuis$e_hat,
-          pi1 = nuis$pi1,
-          pi0 = nuis$pi0,
+          w1 = weights$w1,
+          w0 = weights$w0,
           tau_hat = estimate
         )
         eif_var <- stats::var(eif)
@@ -580,6 +649,9 @@ get_procedure_registry <- function() {
         df_cf <- as.data.frame(df)
         df_cf$.row_id <- seq_len(nrow(df_cf))
         x_covars <- setdiff(covariates, "A")
+        sample_n <- nrow(df_cf)
+        ps_floor <- probability_floor(sample_n)
+        weight_cap <- inverse_weight_cap(sample_n)
 
         fold_obj <- rsample::vfold_cv(df_cf, v = folds)
         q1_star <- rep(NA_real_, nrow(df_cf))
@@ -587,10 +659,15 @@ get_procedure_registry <- function() {
         e_hat <- rep(NA_real_, nrow(df_cf))
         pi1 <- rep(NA_real_, nrow(df_cf))
         pi0 <- rep(NA_real_, nrow(df_cf))
+        pA1 <- rep(NA_real_, nrow(df_cf))
+        pA0 <- rep(NA_real_, nrow(df_cf))
+        pR1A1 <- rep(NA_real_, nrow(df_cf))
+        pR1A0 <- rep(NA_real_, nrow(df_cf))
 
         for (split in fold_obj$splits) {
           train_dat <- rsample::analysis(split)
           assess_dat <- rsample::assessment(split)
+          stabilizers <- fold_stabilizers(train_dat, eps = ps_floor)
 
           train_obs <- train_dat[train_dat$R == 1, , drop = FALSE]
           if (nrow(train_obs) == 0) {
@@ -644,16 +721,19 @@ get_procedure_registry <- function() {
           pi1_assess <- as.numeric(predict(gR_mod, new_data = assess1_fac, type = "prob")$.pred_1)
           pi0_assess <- as.numeric(predict(gR_mod, new_data = assess0_fac, type = "prob")$.pred_1)
 
-
-          # bound all probabilities away from 0 and 1 to avoid positivity issues in clever covariates and targeting step
-          e_assess <- bound_prob(e_assess)
-          piA_assess <- bound_prob(piA_assess)
-          pi1_assess <- bound_prob(pi1_assess)
-          pi0_assess <- bound_prob(pi0_assess)
+          # Bound all probabilities away from 0 and 1 to avoid positivity issues in clever covariates and targeting step.
+          e_assess <- bound_prob(e_assess, eps = ps_floor)
+          piA_assess <- bound_prob(piA_assess, eps = ps_floor)
+          pi1_assess <- bound_prob(pi1_assess, eps = ps_floor)
+          pi0_assess <- bound_prob(pi0_assess, eps = ps_floor)
 
           # 5) Clever covariates for treatment-specific means
-          H1 <- assess_dat$R * (assess_dat$A == 1) / (piA_assess * e_assess)
-          H0 <- assess_dat$R * (assess_dat$A == 0) / (piA_assess * (1 - e_assess))
+          H1 <- assess_dat$R * (assess_dat$A == 1) * stabilizers$pA1 * stabilizers$pR1A1 /
+            (piA_assess * e_assess)
+          H0 <- assess_dat$R * (assess_dat$A == 0) * stabilizers$pA0 * stabilizers$pR1A0 /
+            (piA_assess * (1 - e_assess))
+          H1 <- pmin(H1, weight_cap)
+          H0 <- pmin(H0, weight_cap)
 
           # 6) Targeting step (Gaussian fluctuation) using observed outcomes only
           obs_idx <- which(assess_dat$R == 1)
@@ -672,11 +752,17 @@ get_procedure_registry <- function() {
 
           # 7) Update counterfactual regressions on held-out fold
           idx <- assess_dat$.row_id
-          q1_star[idx] <- Q1_init + eps1 / pi1_assess
-          q0_star[idx] <- Q0_init + eps0 / pi0_assess
+          q1_star[idx] <- Q1_init + eps1 * stabilizers$pA1 * stabilizers$pR1A1 /
+            (pi1_assess * e_assess)
+          q0_star[idx] <- Q0_init + eps0 * stabilizers$pA0 * stabilizers$pR1A0 /
+            (pi0_assess * (1 - e_assess))
           e_hat[idx] <- e_assess
           pi1[idx] <- pi1_assess
           pi0[idx] <- pi0_assess
+          pA1[idx] <- stabilizers$pA1
+          pA0[idx] <- stabilizers$pA0
+          pR1A1[idx] <- stabilizers$pR1A1
+          pR1A0[idx] <- stabilizers$pR1A0
         }
 
         if (anyNA(q1_star) || anyNA(q0_star) || anyNA(e_hat) || anyNA(pi1) || anyNA(pi0)) {
@@ -685,14 +771,14 @@ get_procedure_registry <- function() {
 
         estimate <- mean(q1_star - q0_star)
 
+        weights <- dr_inverse_weights(df = df, e_hat = e_hat, pi1 = pi1, pi0 = pi0)
         eif <- compute_dr_eif(
           df = df,
           outcome = outcome,
           mu0 = q0_star,
           mu1 = q1_star,
-          e_hat = e_hat,
-          pi1 = pi1,
-          pi0 = pi0,
+          w1 = weights$w1,
+          w0 = weights$w0,
           tau_hat = estimate
         )
         eif_var <- stats::var(eif)
